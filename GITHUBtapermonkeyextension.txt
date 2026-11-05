@@ -1,0 +1,2180 @@
+// ==UserScript==
+// @name         GitHub Finder — repo file manager
+// @namespace    https://github.com/
+// @version      2.0.0
+// @description  A macOS Finder-style file manager for any GitHub repo. Browse every folder and file, drag to move, rename, edit, download (files or ZIP), copy links, add files or folders anywhere with +, then commit everything in one go.
+// @match        https://github.com/*
+// @icon         https://github.githubassets.com/favicons/favicon.svg
+// @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_deleteValue
+// @grant        GM_registerMenuCommand
+// @grant        GM_setClipboard
+// @connect      api.github.com
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+  if (window.top !== window.self) return;
+
+  /* ───────────────────────── config ───────────────────────── */
+  const API = 'https://api.github.com';
+  const TOKEN_KEY = 'ghu_token'; // same key as the old uploader, so your saved token keeps working
+  const MAX_FILE_BYTES = 100 * 1024 * 1024; // GitHub blob limit
+  const MAX_EDIT_BYTES = 2 * 1024 * 1024;
+  const MAX_TEXT_PREVIEW = 400 * 1024;
+  const MAX_IMG_PREVIEW = 12 * 1024 * 1024;
+  const CONCURRENCY = 4;
+  const TREE_CHUNK = 300;
+  const MAX_RENDER = 4000;
+  const JUNK = [/(^|\/)\.DS_Store$/i, /(^|\/)Thumbs\.db$/i, /(^|\/)desktop\.ini$/i, /(^|\/)node_modules\//];
+  const STEPS = ['Checking branch', 'Uploading files', 'Building tree', 'Creating commit', 'Updating branch'];
+  const RESERVED = new Set(['settings', 'orgs', 'marketplace', 'explore', 'notifications', 'topics', 'sponsors', 'login', 'join', 'pulls', 'issues', 'codespaces', 'features', 'pricing', 'about', 'enterprise', 'apps', 'users', 'organizations', 'collections', 'trending', 'search', 'new', 'import', 'sessions', 'security', 'contact', 'customer-stories', 'readme', 'site', 'stars', 'watching', 'account', 'dashboard', 'copilot', 'solutions', 'resources', 'team', 'models', 'mcp', 'github-copilot']);
+  const IMG_MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml', bmp: 'image/bmp', ico: 'image/x-icon', avif: 'image/avif' };
+  const BIN_EXT = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'ico', 'avif', 'psd', 'zip', 'gz', 'tgz', 'tar', 'rar', '7z', 'bz2', 'xz', 'pdf', 'exe', 'dll', 'so', 'dylib', 'bin', 'class', 'jar', 'war', 'mp3', 'wav', 'flac', 'ogg', 'm4a', 'mp4', 'mov', 'avi', 'mkv', 'webm', 'woff', 'woff2', 'ttf', 'otf', 'eot', 'pyc', 'o', 'a', 'wasm', 'dmg', 'iso', 'apk', 'ipa', 'sqlite', 'db', 'xls', 'xlsx', 'doc', 'docx', 'ppt', 'pptx', 'key', 'pages', 'numbers']);
+  const KINDS = { js: 'JavaScript Source', mjs: 'JavaScript Module', cjs: 'JavaScript Module', jsx: 'React Component', ts: 'TypeScript Source', tsx: 'React TypeScript', json: 'JSON Document', md: 'Markdown Document', txt: 'Plain Text', html: 'HTML Document', htm: 'HTML Document', css: 'Style Sheet', scss: 'Sass Style Sheet', py: 'Python Script', rb: 'Ruby Script', sh: 'Shell Script', bash: 'Shell Script', yml: 'YAML Document', yaml: 'YAML Document', toml: 'TOML Document', xml: 'XML Document', svg: 'SVG Image', png: 'PNG Image', jpg: 'JPEG Image', jpeg: 'JPEG Image', gif: 'GIF Image', webp: 'WebP Image', ico: 'Icon', pdf: 'PDF Document', zip: 'ZIP Archive', gz: 'GZip Archive', tar: 'TAR Archive', csv: 'CSV Document', c: 'C Source', h: 'C Header', cpp: 'C++ Source', java: 'Java Source', go: 'Go Source', rs: 'Rust Source', php: 'PHP Script', swift: 'Swift Source', kt: 'Kotlin Source', cs: 'C# Source', sql: 'SQL Script', lock: 'Lock File', log: 'Log File', env: 'Environment File', gitignore: 'Git Ignore', mp4: 'MPEG-4 Movie', mp3: 'MP3 Audio', wav: 'WAV Audio' };
+  const EXT_COLOR = {};
+  [['#e0a800', 'js mjs cjs'], ['#3178c6', 'ts tsx'], ['#14a5c9', 'jsx'], ['#e8590c', 'html htm xml'], ['#8e44ad', 'css scss sass less'], ['#2e9e5b', 'py rb sh bash zsh php'], ['#5c6bc0', 'c cpp h hpp rs go java kt swift cs sql'], ['#6b7280', 'md txt log csv json yml yaml toml ini env lock gitignore'], ['#d6403a', 'pdf'], ['#e0457b', 'png jpg jpeg gif webp svg ico bmp avif'], ['#a66a3f', 'zip tar gz tgz rar 7z bz2 xz'], ['#7b61d1', 'mp3 wav flac ogg m4a mp4 mov avi mkv webm']].forEach(([c, l]) => l.split(' ').forEach((e) => { EXT_COLOR[e] = c; }));
+
+  /* ───────────────────────── tiny helpers ───────────────────────── */
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const encRef = (s) => s.split('/').map(encodeURIComponent).join('/');
+  const fmt = (b) => (b < 1024 ? `${b} B` : b < 1048576 ? `${(b / 1024).toFixed(1)} KB` : b < 1073741824 ? `${(b / 1048576).toFixed(1)} MB` : `${(b / 1073741824).toFixed(2)} GB`);
+  const cleanPath = (p) => (p || '').replace(/\\/g, '/').split('/').map((s) => s.trim()).filter(Boolean).join('/');
+  const validPath = (p) => !p.split('/').some((s) => s === '.' || s === '..' || s.toLowerCase() === '.git');
+  const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
+  const isJunk = (p) => JUNK.some((r) => r.test(p));
+  const dirname = (p) => { const i = p.lastIndexOf('/'); return i < 0 ? '' : p.slice(0, i); };
+  const basename = (p) => p.slice(p.lastIndexOf('/') + 1);
+  const join = (a, b) => (a ? `${a}/${b}` : b);
+  const extOf = (n) => { const i = n.lastIndexOf('.'); return i > 0 ? n.slice(i + 1).toLowerCase() : ''; };
+  const splitName = (n) => { const i = n.lastIndexOf('.'); return i > 0 ? [n.slice(0, i), n.slice(i)] : [n, '']; };
+  const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+  const kindOf = (name, dir, type) => (dir ? 'Folder' : type === 'commit' ? 'Submodule' : KINDS[extOf(name)] || (extOf(name) ? `${extOf(name).toUpperCase()} Document` : 'Document'));
+
+  const h = (tag, props, ...kids) => {
+    const el = document.createElement(tag);
+    for (const [k, v] of Object.entries(props || {})) {
+      if (v == null || v === false) continue;
+      if (k === 'class') el.className = v;
+      else if (k === 'value') el.value = v;
+      else if (k.startsWith('on')) el.addEventListener(k.slice(2).toLowerCase(), v);
+      else if (v === true) el.setAttribute(k, k === 'draggable' ? 'true' : '');
+      else el.setAttribute(k, v);
+    }
+    for (const kid of kids.flat(Infinity)) if (kid != null && kid !== false) el.append(kid.nodeType ? kid : document.createTextNode(kid));
+    return el;
+  };
+
+  const ICONS = {
+    back: '<path d="M15 5l-7 7 7 7"/>', fwd: '<path d="M9 5l7 7-7 7"/>',
+    plus: '<path d="M12 5v14M5 12h14"/>', x: '<path d="M6 6l12 12M18 6L6 18"/>', check: '<path d="M5 12.5l4.5 4.5L19 7.5"/>',
+    grid: '<rect x="4" y="4" width="7" height="7" rx="1.8"/><rect x="13" y="4" width="7" height="7" rx="1.8"/><rect x="4" y="13" width="7" height="7" rx="1.8"/><rect x="13" y="13" width="7" height="7" rx="1.8"/>',
+    list: '<path d="M9 6h11M9 12h11M9 18h11"/><circle cx="4.6" cy="6" r=".9"/><circle cx="4.6" cy="12" r=".9"/><circle cx="4.6" cy="18" r=".9"/>',
+    sort: '<path d="M4 7h16M7 12h10M10 17h4"/>', gear: '<circle cx="12" cy="12" r="3"/><path d="M12 3v2.5M12 18.5V21M3 12h2.5M18.5 12H21M5.6 5.6l1.8 1.8M16.6 16.6l1.8 1.8M5.6 18.4l1.8-1.8M16.6 7.4l1.8-1.8"/>',
+    search: '<circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/>', trash: '<path d="M4 7h16M9 7V4.5h6V7M6 7l1 13h10l1-13M10 11v6M14 11v6"/>',
+    download: '<path d="M12 4v11M7 11l5 5 5-5M5 20h14"/>', upload: '<path d="M12 16V4M7 9l5-5 5 5M4 20h16"/>',
+    link: '<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1"/><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/>',
+    edit: '<path d="M4 20l1-4L16 5l3 3L8 19z"/><path d="M14 7l3 3"/>', info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5v.01"/>',
+    sidebar: '<rect x="3" y="5" width="18" height="14" rx="3"/><path d="M9 5v14"/>', panel: '<rect x="3" y="5" width="18" height="14" rx="3"/><path d="M15 5v14"/>',
+    undo: '<path d="M9 14L4 9l5-5"/><path d="M4 9h10a6 6 0 0 1 0 12h-3"/>', redo: '<path d="M15 14l5-5-5-5"/><path d="M20 9H10a6 6 0 0 0 0 12h3"/>',
+    refresh: '<path d="M20 11a8 8 0 1 0-2.3 5.7M20 5v6h-6"/>', branch: '<circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="8" r="2"/><path d="M6 7v10M18 10c0 4-6 3-12 7"/>',
+    key: '<circle cx="8" cy="15" r="4"/><path d="M10.8 12.2L20 3M16 7l3 3"/>', ext: '<path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/>',
+    repo: '<path d="M5 19V5a2 2 0 0 1 2-2h12v15H7a2 2 0 0 0-2 2zm0 0a2 2 0 0 0 2 2h12"/>', alert: '<circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16.5v.01"/>',
+    up: '<path d="M6 15l6-6 6 6"/>', down: '<path d="M6 9l6 6 6-6"/>', chev: '<path d="M9 6l6 6-6 6"/>', dots: '<circle cx="5" cy="12" r="1.2"/><circle cx="12" cy="12" r="1.2"/><circle cx="19" cy="12" r="1.2"/>',
+    folderPlus: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/><path d="M12 10.5v5M9.5 13h5"/>',
+    filePlus: '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8l-5-5z"/><path d="M14 3v5h5M12 12v6M9 15h6"/>',
+    eye: '<path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12z"/><circle cx="12" cy="12" r="2.8"/>', copy: '<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/>',
+  };
+  const svgIco = (name, size = 16, sw = 1.8) => `<svg viewBox="0 0 24 24" width="${size}" height="${size}" fill="none" stroke="currentColor" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name]}</svg>`;
+  const icon = (name, size = 16, sw) => { const s = h('span', { class: 'ico' }); s.innerHTML = svgIco(name, size, sw); return s; };
+
+  const folderSvg = (w) => `<svg viewBox="0 0 64 52" width="${w}" height="${Math.round(w * 52 / 64)}" aria-hidden="true"><path fill="url(#gfb)" d="M4 9a5 5 0 0 1 5-5h14.2c1.6 0 3.1.8 4.1 2l2.2 3H55a5 5 0 0 1 5 5v27a5 5 0 0 1-5 5H9a5 5 0 0 1-5-5z"/><path fill="url(#gff)" d="M4 18a5 5 0 0 1 5-5h46a5 5 0 0 1 5 5v24a5 5 0 0 1-5 5H9a5 5 0 0 1-5-5z"/><path fill="none" stroke="rgba(255,255,255,.35)" d="M9.5 13.5h45"/></svg>`;
+  const fileSvg = (w, name, type) => {
+    const ext = type === 'commit' ? 'sub' : extOf(name);
+    const col = EXT_COLOR[ext] || '#8e8e93';
+    const big = w >= 40;
+    const label = big && ext ? `<text x="24" y="45.2" text-anchor="middle" font-size="${ext.length > 3 ? 6.4 : 7.6}" font-weight="700" fill="#fff" font-family="-apple-system,BlinkMacSystemFont,Helvetica,Arial,sans-serif">${ext.slice(0, 5).toUpperCase().replace(/[<>&]/g, '')}</text>` : '';
+    return `<svg viewBox="0 0 48 60" width="${w}" height="${Math.round(w * 60 / 48)}" aria-hidden="true"><path d="M7 5a5 5 0 0 1 5-5h18l13 13v42a5 5 0 0 1-5 5H12a5 5 0 0 1-5-5z" fill="url(#gpg)" stroke="rgba(0,0,0,.16)"/><path d="M30 .5V9a4 4 0 0 0 4 4h8.5z" fill="rgba(0,0,0,.13)"/><rect x="${big ? 11 : 12}" y="${big ? 37 : 38}" width="${big ? 26 : 24}" height="${big ? 11 : 9}" rx="${big ? 3 : 2.5}" fill="${col}"/>${big ? '' : '<path d="M13 22h18M13 28h22" stroke="rgba(0,0,0,.18)" stroke-width="2.6" stroke-linecap="round"/>'}${label}${big ? '<path d="M13 22h20M13 28h22" stroke="rgba(0,0,0,.14)" stroke-width="2.4" stroke-linecap="round"/>' : ''}</svg>`;
+  };
+  const itemIcon = (it, w) => { const s = h('span', { class: 'fico' }); s.innerHTML = it.dir ? folderSvg(w) : fileSvg(w, it.name, it.e && it.e.type); return s; };
+
+  /* ───────────────────────── state ───────────────────────── */
+  const S = {
+    open: false, min: false, max: false, win: null,
+    repo: null, branch: '', defaultBranch: '', headSha: '', branches: [], readOnly: false,
+    loading: false, loadError: '',
+    cwd: '', hist: [''], hi: 0,
+    view: GM_getValue('ghf_view', 'list'), sort: { key: 'name', dir: 1 },
+    sel: new Set(), anchor: null, exp: new Set(), sbExp: new Set(['']),
+    q: '', renaming: null, clip: null, drag: null,
+    sidebar: true, inspector: GM_getValue('ghf_insp', true), appearance: GM_getValue('ghf_theme', 'auto'),
+    skipJunk: GM_getValue('ghf_junk', true), showHidden: GM_getValue('ghf_hidden', true),
+  };
+
+  /* ───────────────────────── GitHub API ───────────────────────── */
+  let onWait = null;
+  const token = () => GM_getValue(TOKEN_KEY, '');
+
+  function gm(method, url, body, tok, raw) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method, url, timeout: 180000, responseType: raw ? 'arraybuffer' : undefined,
+        headers: Object.assign({ Accept: raw ? 'application/vnd.github.raw+json' : 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' }, tok ? { Authorization: `Bearer ${tok}` } : {}, body ? { 'Content-Type': 'application/json' } : {}),
+        data: body ? JSON.stringify(body) : undefined,
+        onload: (r) => {
+          const ok = r.status >= 200 && r.status < 300;
+          let data = null;
+          if (raw && ok) data = r.response;
+          else {
+            let t = r.responseText;
+            if (raw) { try { t = new TextDecoder().decode(r.response); } catch (_) { t = ''; } }
+            try { data = JSON.parse(t); } catch (_) { /* not json */ }
+          }
+          resolve({ status: r.status, data, headers: r.responseHeaders || '' });
+        },
+        onerror: () => reject(new Error('Network error. Check your connection and try again.')),
+        ontimeout: () => reject(new Error('GitHub took too long to respond.')),
+      });
+    });
+  }
+
+  async function api(method, path, body, opts = {}) {
+    const tok = token();
+    if (!tok) { const e = new Error('No token saved.'); e.status = 401; throw e; }
+    const retries = opts.retries == null ? 4 : opts.retries;
+    for (let attempt = 0; ; attempt++) {
+      const r = await gm(method, API + path, body, tok, opts.raw);
+      if (r.status >= 200 && r.status < 300) return r.data;
+      const msg = (r.data && r.data.message) || `HTTP ${r.status}`;
+      const limited = r.status === 429 || (r.status === 403 && /rate limit|abuse|secondary/i.test(msg));
+      if (limited && attempt < retries) {
+        const ra = /retry-after:\s*(\d+)/i.exec(r.headers);
+        const secs = ra ? +ra[1] : Math.pow(2, attempt) * 4;
+        if (onWait) onWait(secs);
+        await sleep(secs * 1000);
+        continue;
+      }
+      const err = new Error(msg);
+      err.status = r.status;
+      throw err;
+    }
+  }
+
+  const friendly = (e) => {
+    if (e.status === 401) return 'GitHub rejected your token (expired or revoked). Add a new one in Account settings.';
+    if (e.status === 403 || e.status === 404) return `${e.message}. Check that your token can access this repo (classic token: "repo" scope; fine-grained: Contents → Read and write).`;
+    if (e.status === 422 && /already exists/i.test(e.message)) return 'A branch with that name already exists. Pick a different name.';
+    if (e.status === 422 && /fast forward/i.test(e.message)) return 'The branch changed while committing. Try again.';
+    return e.message || 'Something went wrong.';
+  };
+
+  /* ───────────────────────── page / repo detection ───────────────────────── */
+  function parsePage() {
+    const parts = location.pathname.split('/').filter(Boolean);
+    if (parts.length < 2 || RESERVED.has(parts[0].toLowerCase())) return null;
+    if (parts.length > 2 && !['tree', 'blob'].includes(parts[2])) return null;
+    let rest = [];
+    try { rest = parts.slice(3).map(decodeURIComponent); } catch (_) { rest = parts.slice(3); }
+    return { owner: parts[0], name: parts[1], kind: parts[2] || null, rest };
+  }
+
+  /* ───────────────────────── repository model ─────────────────────────
+     B = what GitHub has (read-only).  W = working copy: path → entry.
+     Every Finder action edits W; "Commit" diffs W against B in one go.   */
+  const B = { blobs: new Map(), trees: new Map(), loaded: new Set(), complete: true, rootSha: '' };
+  let W = new Map();
+  let undoSt = [];
+  let redoSt = [];
+  let IDX = null;
+  let CHG = null;
+  let VER = 0;
+  let CUR = null;
+  const BC = new Map(); // blob cache by sha
+
+  const isLoaded = (p) => B.complete || B.loaded.has(p) || (p !== '' && !B.trees.has(p));
+
+  function ingest(list, prefix) {
+    for (const e of list) {
+      const p = prefix + e.path;
+      if (e.type === 'tree') { if (!B.trees.has(p)) B.trees.set(p, e.sha); }
+      else if (!B.blobs.has(p)) {
+        const be = { mode: e.mode, type: e.type, sha: e.sha, size: e.size || 0 };
+        B.blobs.set(p, be);
+        W.set(p, be);
+      }
+    }
+  }
+
+  const treeUrl = (sha, deep) => `/repos/${S.repo.owner}/${S.repo.name}/git/trees/${sha}${deep ? '?recursive=1' : ''}`;
+
+  async function fetchTree(p, deep) {
+    const sha = p === '' ? B.rootSha : B.trees.get(p);
+    if (!sha) return;
+    const t = await api('GET', treeUrl(sha, deep));
+    if (deep && t.truncated) { const e = new Error('TRUNC'); e.code = 'TRUNC'; throw e; }
+    ingest(t.tree, p ? `${p}/` : '');
+    B.loaded.add(p);
+    if (deep) for (const e of t.tree) if (e.type === 'tree') B.loaded.add(join(p, e.path));
+    bump();
+  }
+
+  const ensureShallow = async (p) => { if (!isLoaded(p)) await fetchTree(p, false); };
+  const stubsUnder = (p) => [...B.trees.keys()].filter((k) => !B.loaded.has(k) && (p === '' || k === p || k.startsWith(`${p}/`)));
+  async function deepLoad(p) {
+    if (B.complete) return;
+    if (p === '' ? !B.loaded.has('') : !isLoaded(p)) {
+      try { await fetchTree(p, true); return; } catch (e) { if (e.code !== 'TRUNC') throw e; }
+    }
+    for (let guard = 0; guard < 400; guard++) {
+      const s = stubsUnder(p);
+      if (!s.length) break;
+      await pool(s, CONCURRENCY, (k) => fetchTree(k, false));
+    }
+  }
+
+  function bump() {
+    VER++; IDX = null; CHG = null;
+    if (ui.ready) ui.all();
+  }
+
+  /* index: directory path → Map(name → item) */
+  function idx() {
+    if (IDX) return IDX;
+    const dirs = new Map();
+    const ensure = (d) => { let m = dirs.get(d); if (!m) { m = new Map(); dirs.set(d, m); } return m; };
+    ensure('');
+    for (const [p, e] of W) {
+      const parts = p.split('/');
+      let d = '';
+      for (let i = 0; i < parts.length - 1; i++) {
+        const np = d ? `${d}/${parts[i]}` : parts[i];
+        const m = ensure(d);
+        if (!m.has(parts[i])) m.set(parts[i], { name: parts[i], path: np, dir: true });
+        ensure(np);
+        d = np;
+      }
+      ensure(d).set(parts[parts.length - 1], { name: parts[parts.length - 1], path: p, dir: false, e });
+    }
+    if (!B.complete) {
+      const tp = [...B.trees.keys()].sort((a, b) => b.split('/').length - a.split('/').length);
+      for (const p of tp) {
+        const parent = dirname(p);
+        const alive = !isLoaded(p) || (dirs.get(p) && dirs.get(p).size > 0);
+        if (!alive) continue;
+        ensure(p);
+        const m = ensure(parent);
+        if (!m.has(basename(p))) m.set(basename(p), { name: basename(p), path: p, dir: true, stub: !isLoaded(p) });
+      }
+    }
+    IDX = dirs;
+    return dirs;
+  }
+  const isDir = (p) => p === '' || idx().has(p);
+  const exists = (p) => W.has(p) || isDir(p);
+  const listDir = (p) => { const m = idx().get(p); return m ? [...m.values()] : []; };
+  const under = (p) => { const out = []; const pre = `${p}/`; for (const k of W.keys()) if (k === p || k.startsWith(pre)) out.push(k); return out; };
+  const topLevel = (paths) => { const set = new Set(paths); return paths.filter((p) => { let d = dirname(p); while (d) { if (set.has(d)) return false; d = dirname(d); } return true; }); };
+
+  /* pending changes (diff of W against B), memoised per version */
+  function chg() {
+    if (CHG && CHG.v === VER) return CHG;
+    const c = { v: VER, adds: [], mods: [], moves: [], copies: [], dels: [], st: new Map(), dirty: new Set(), total: 0 };
+    const mark = (p) => { let d = dirname(p); while (d && !c.dirty.has(d)) { c.dirty.add(d); d = dirname(d); } };
+    for (const [p, e] of W) {
+      const b = B.blobs.get(p);
+      let s = null;
+      if (e.dirty) s = b ? 'mod' : 'new';
+      else if (!b || b.sha !== e.sha || b.mode !== e.mode) s = e.from && e.from !== p && W.has(e.from) ? 'copy' : 'move';
+      if (s) { c.st.set(p, s); (s === 'new' ? c.adds : s === 'mod' ? c.mods : s === 'copy' ? c.copies : c.moves).push(p); mark(p); }
+    }
+    for (const p of B.blobs.keys()) if (!W.has(p)) { c.dels.push(p); mark(p); }
+    c.total = c.adds.length + c.mods.length + c.moves.length + c.copies.length + c.dels.length;
+    CHG = c;
+    return c;
+  }
+
+  /* every user action goes through mutate() so it can be undone */
+  const setW = (p, e) => { CUR.push({ p, prev: W.get(p), next: e }); if (e) W.set(p, e); else W.delete(p); };
+  function mutate(label, fn) {
+    CUR = [];
+    try { fn(); } finally { const ch = CUR; CUR = null; if (ch.length) { undoSt.push({ label, ch }); redoSt.length = 0; } }
+    pruneSel();
+    bump();
+  }
+  function undo() {
+    const o = undoSt.pop();
+    if (!o) return toast('Nothing to undo');
+    for (let i = o.ch.length - 1; i >= 0; i--) { const c = o.ch[i]; if (c.prev) W.set(c.p, c.prev); else W.delete(c.p); }
+    redoSt.push(o); pruneSel(); bump(); toast(`Undid “${o.label}”`);
+  }
+  function redo() {
+    const o = redoSt.pop();
+    if (!o) return toast('Nothing to redo');
+    for (const c of o.ch) { if (c.next) W.set(c.p, c.next); else W.delete(c.p); }
+    undoSt.push(o); pruneSel(); bump(); toast(`Redid “${o.label}”`);
+  }
+  function pruneSel() {
+    const keep = new Set();
+    for (const p of S.sel) if (exists(p)) keep.add(p);
+    S.sel = keep;
+    if (S.anchor && !keep.has(S.anchor)) S.anchor = null;
+    if (!isDir(S.cwd)) { S.cwd = ''; }
+  }
+
+  async function pool(items, n, worker) {
+    let i = 0;
+    let failed = false;
+    const run = async () => {
+      while (i < items.length && !failed) {
+        const k = i++;
+        try { await worker(items[k], k); } catch (e) { failed = true; throw e; }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(n, items.length) }, run));
+  }
+
+  /* ───────────────────────── loading the repo ───────────────────────── */
+  async function detectLocation() {
+    const page = parsePage();
+    if (!page) return null;
+    const base = `/repos/${page.owner}/${page.name}`;
+    const info = await api('GET', base);
+    let branch = info.default_branch;
+    let parts = [];
+    let selPath = '';
+    if (page.rest.length) {
+      for (let i = 1; i <= page.rest.length; i++) {
+        const cand = page.rest.slice(0, i).join('/');
+        try {
+          await api('GET', `${base}/git/ref/heads/${encRef(cand)}`, null, { retries: 0 });
+          branch = cand;
+          parts = page.rest.slice(i);
+          if (page.kind === 'blob') { selPath = parts.join('/'); parts.pop(); }
+          break;
+        } catch (e) { if (e.status === 401) throw e; }
+      }
+    }
+    return { page, info, branch, cwd: parts.join('/'), selPath };
+  }
+
+  async function loadLocation() {
+    S.loading = true; S.loadError = ''; ui.all();
+    try {
+      const d = await detectLocation();
+      if (!d) { S.loading = false; return; }
+      S.repo = { owner: d.page.owner, name: d.page.name, full: d.info.full_name };
+      S.defaultBranch = d.info.default_branch;
+      S.branch = d.branch;
+      S.readOnly = !!(d.info.permissions && d.info.permissions.push === false);
+      S.branches = [];
+      await loadTree(d.cwd, d.selPath);
+      if (S.readOnly) toast(`You don’t have write access to ${S.repo.full}. You can browse, but committing will fail.`, { ms: 6000 });
+      api('GET', `/repos/${S.repo.owner}/${S.repo.name}/branches?per_page=100`).then((bs) => { S.branches = bs.map((b) => b.name); }).catch(() => {});
+    } catch (e) {
+      S.loading = false; S.loadError = friendly(e); S.repo = null;
+      if (e.status === 401) showTokenSheet();
+      ui.all();
+    }
+  }
+
+  async function loadTree(cwd = S.cwd, selPath = '') {
+    const { owner, name } = S.repo;
+    const base = `/repos/${owner}/${name}`;
+    S.loading = true; S.loadError = ''; ui.all();
+    try {
+      let ref;
+      try { ref = await api('GET', `${base}/git/ref/heads/${encRef(S.branch)}`); } catch (e) {
+        if (e.status === 409) throw new Error('This repository is empty. Create a first commit on GitHub (for example a README), then try again.');
+        throw e;
+      }
+      const commit = await api('GET', `${base}/git/commits/${ref.object.sha}`);
+      S.headSha = ref.object.sha;
+      B.rootSha = commit.tree.sha;
+      B.blobs.clear(); B.trees.clear(); B.loaded.clear();
+      W = new Map(); undoSt = []; redoSt = [];
+      let t = await api('GET', treeUrl(B.rootSha, true));
+      B.complete = !t.truncated;
+      if (!B.complete) { t = await api('GET', treeUrl(B.rootSha, false)); B.loaded.add(''); toast('Large repository: folders load as you open them.', { ms: 5000 }); }
+      ingest(t.tree, '');
+      IDX = null; CHG = null; VER++;
+      S.cwd = isDir(cwd) ? cwd : '';
+      S.hist = [S.cwd]; S.hi = 0;
+      S.sel = new Set(selPath && W.has(selPath) ? [selPath] : []);
+      S.anchor = selPath || null; S.exp = new Set(); S.q = ''; S.renaming = null;
+      S.sbExp = new Set(['']);
+      for (let d = S.cwd; d; d = dirname(d)) S.sbExp.add(d);
+      S.loading = false;
+      ui.all();
+    } catch (e) {
+      S.loading = false; S.loadError = friendly(e);
+      if (e.status === 401) showTokenSheet();
+      ui.all();
+    }
+  }
+
+  async function switchBranch(name) {
+    if (name === S.branch) return;
+    if (chg().total) {
+      const r = await dialog({ title: `Switch to “${name}”?`, msg: `You have ${plural(chg().total, 'uncommitted change')}. Switching branches discards them.`, buttons: [{ label: 'Cancel', value: null }, { label: 'Discard & Switch', value: 'go', danger: true }] });
+      if (!r.value) return;
+    }
+    S.branch = name;
+    await loadTree('');
+  }
+
+  async function createBranch() {
+    const r = await dialog({ title: 'New branch', msg: `Create a branch from “${S.branch}” at its current commit.`, input: { placeholder: 'feature/my-branch' }, buttons: [{ label: 'Cancel', value: null }, { label: 'Create', value: 'ok', primary: true }] });
+    const nb = r.value && r.text.trim();
+    if (!nb) return;
+    if (!/^\w[\w.\-/]*$/.test(nb) || /\.\.|\/\/|\/$|\.lock$/.test(nb)) return toast('That isn’t a valid branch name.', { type: 'err' });
+    try {
+      await api('POST', `/repos/${S.repo.owner}/${S.repo.name}/git/refs`, { ref: `refs/heads/${nb}`, sha: S.headSha });
+      S.branches.push(nb);
+      toast(`Created branch “${nb}”.`, { action: { label: 'Switch', fn: () => switchBranch(nb) } });
+    } catch (e) { toast(friendly(e), { type: 'err' }); }
+  }
+
+  /* ───────────────────────── navigation & selection ───────────────────────── */
+  async function navigate(path, push = true) {
+    try { await ensureShallow(path); } catch (e) { return toast(friendly(e), { type: 'err' }); }
+    S.cwd = path; S.q = ''; ui.search.value = ''; S.sel = new Set(); S.anchor = null; S.renaming = null;
+    for (let d = path; d; d = dirname(d)) S.sbExp.add(d);
+    if (push) { S.hist = S.hist.slice(0, S.hi + 1); if (S.hist[S.hi] !== path) { S.hist.push(path); S.hi = S.hist.length - 1; } }
+    ui.all();
+    ui.content.scrollTop = 0;
+  }
+  const goBack = () => { if (S.hi > 0) { S.hi--; navigate(S.hist[S.hi], false); } };
+  const goFwd = () => { if (S.hi < S.hist.length - 1) { S.hi++; navigate(S.hist[S.hi], false); } };
+  const goUp = () => { if (S.cwd) navigate(dirname(S.cwd)); };
+  async function reveal(path) {
+    await navigate(dirname(path));
+    S.sel = new Set([path]); S.anchor = path; ui.all();
+    const el = ui.rowEls.get(path); if (el) el.scrollIntoView({ block: 'center' });
+  }
+
+  /* ───────────────────────── file actions ───────────────────────── */
+  const newEntry = (file, text) => ({ mode: '100644', type: 'blob', sha: null, size: file ? file.size : new TextEncoder().encode(text || '').length, file: file || null, text: file ? null : text || '', dirty: true });
+
+  function uniqueName(dir, name, suffix = ' copy') {
+    if (!exists(join(dir, name))) return name;
+    const [stem, ext] = splitName(name);
+    for (let k = 1; ; k++) { const n = `${stem}${suffix}${k > 1 ? ` ${k}` : ''}${ext}`; if (!exists(join(dir, n))) return n; }
+  }
+
+  async function prepare(paths) {
+    if (B.complete) return;
+    const dirs = paths.filter((p) => isDir(p));
+    if (!dirs.length) return;
+    toast('Reading folders…', { id: 'prep', ms: 1500 });
+    for (const d of dirs) await deepLoad(d);
+  }
+
+  async function askConflict(name, state, multi) {
+    if (state.all) return state.all;
+    const r = await dialog({
+      title: `“${name}” already exists here`, msg: 'Do you want to replace it with the one you’re adding?',
+      check: multi ? 'Apply to all' : null,
+      buttons: [{ label: 'Stop', value: 'stop' }, { label: 'Skip', value: 'skip' }, { label: 'Keep Both', value: 'both' }, { label: 'Replace', value: 'replace', primary: true }],
+    });
+    const v = r.value || 'stop';
+    if (r.checked && v !== 'stop') state.all = v;
+    return v;
+  }
+
+  async function transfer(paths, destDir, copy) {
+    paths = topLevel(paths);
+    try { await prepare(paths); await ensureShallow(destDir); } catch (e) { return toast(friendly(e), { type: 'err' }); }
+    const plan = []; const state = {}; let stopped = false;
+    for (const src of paths) {
+      if (!W.has(src) && !isDir(src)) continue;
+      const name = basename(src);
+      let dest = join(destDir, name);
+      let replace = false;
+      if (!copy && dirname(src) === destDir) continue;
+      if (isDir(src) && (destDir === src || destDir.startsWith(`${src}/`))) { toast('A folder can’t be moved into itself.', { type: 'err' }); continue; }
+      if (copy && dirname(src) === destDir) dest = join(destDir, uniqueName(destDir, name));
+      else if (exists(dest)) {
+        const v = await askConflict(name, state, paths.length > 1);
+        if (v === 'stop') { stopped = true; break; }
+        if (v === 'skip') continue;
+        if (v === 'both') dest = join(destDir, uniqueName(destDir, name));
+        else replace = true;
+      }
+      plan.push({ src, dest, replace });
+    }
+    if (stopped && !plan.length) return;
+    if (!plan.length) return;
+    const label = `${copy ? 'Copy' : 'Move'} ${plan.length === 1 ? `“${basename(plan[0].src)}”` : plural(plan.length, 'item')}`;
+    mutate(label, () => {
+      for (const op of plan) {
+        if (op.replace) for (const k of under(op.dest)) setW(k, undefined);
+        for (const k of under(op.src)) {
+          const e = W.get(k);
+          setW(op.dest + k.slice(op.src.length), { ...e, from: e.from || k });
+          if (!copy) setW(k, undefined);
+        }
+      }
+    });
+    if (destDir === S.cwd) { S.sel = new Set(plan.map((o) => o.dest)); S.anchor = plan[0].dest; ui.all(); }
+    toast(`${copy ? 'Copied' : 'Moved'} ${plan.length === 1 ? `“${basename(plan[0].src)}”` : plural(plan.length, 'item')} to ${destDir ? `“${basename(destDir)}”` : S.repo.name}.`, { action: { label: 'Undo', fn: undo } });
+  }
+
+  function validName(name, dir, self) {
+    if (!name) return 'Enter a name.';
+    if (/[\\/]/.test(name)) return 'Names can’t contain slashes.';
+    if (name === '.' || name === '..' || name.toLowerCase() === '.git') return 'That name isn’t allowed.';
+    if (name !== self && exists(join(dir, name))) return `“${name}” is already taken.`;
+    return '';
+  }
+
+  async function renameItem(path, newName) {
+    newName = newName.trim();
+    const dir = dirname(path);
+    if (newName === basename(path)) return true;
+    const bad = validName(newName, dir, basename(path));
+    if (bad) { toast(bad, { type: 'err' }); return false; }
+    try { await prepare([path]); } catch (e) { toast(friendly(e), { type: 'err' }); return false; }
+    const dest = join(dir, newName);
+    mutate(`Rename “${basename(path)}”`, () => {
+      for (const k of under(path)) { const e = W.get(k); setW(dest + k.slice(path.length), { ...e, from: e.from || k }); setW(k, undefined); }
+    });
+    if (S.exp.has(path)) { S.exp.delete(path); S.exp.add(dest); }
+    S.sel = new Set([dest]); S.anchor = dest; ui.all();
+    return true;
+  }
+
+  async function deleteItems(paths) {
+    paths = topLevel(paths);
+    if (!paths.length) return;
+    try { await prepare(paths); } catch (e) { return toast(friendly(e), { type: 'err' }); }
+    const n = paths.length;
+    const label = n === 1 ? `Delete “${basename(paths[0])}”` : `Delete ${plural(n, 'item')}`;
+    mutate(label, () => { for (const p of paths) for (const k of under(p)) setW(k, undefined); });
+    S.sel = new Set(); S.anchor = null; ui.all();
+    toast(`Deleted ${n === 1 ? `“${basename(paths[0])}”` : plural(n, 'item')}. Nothing is final until you commit.`, { action: { label: 'Undo', fn: undo } });
+  }
+
+  async function newFolder(dir = S.cwd) {
+    try { await ensureShallow(dir); } catch (e) { return toast(friendly(e), { type: 'err' }); }
+    if (dir !== S.cwd || S.q) await navigate(dir);
+    const name = uniqueName(dir, 'untitled folder', '');
+    const p = join(dir, name);
+    mutate('New folder', () => setW(join(p, '.gitkeep'), newEntry(null, '')));
+    S.sel = new Set([p]); S.anchor = p; S.renaming = p; ui.all();
+    startRename();
+  }
+
+  function newFile(dir = S.cwd) { openEditor(null, dir); }
+
+  function pickFiles(dir, folder) {
+    ui.pickDir = dir;
+    const inp = folder ? ui.dirInput : ui.fileInput;
+    inp.value = '';
+    inp.click();
+  }
+
+  async function addUploads(list, destDir) {
+    try { await ensureShallow(destDir); } catch (e) { return toast(friendly(e), { type: 'err' }); }
+    const tops = new Set(list.map((x) => cleanPath(x.path).split('/')[0]).filter(Boolean));
+    try { for (const t of tops) { const tp = join(destDir, t); if (!B.complete && B.trees.has(tp)) await deepLoad(tp); } } catch (e) { return toast(friendly(e), { type: 'err' }); }
+    const skipped = { junk: 0, big: 0, bad: 0, clash: 0 };
+    const plan = new Map(); const state = {};
+    for (const { path, file } of list) {
+      const p = cleanPath(path);
+      if (!p) continue;
+      if (!validPath(p)) { skipped.bad++; continue; }
+      if (S.skipJunk && isJunk(p)) { skipped.junk++; continue; }
+      if (file.size > MAX_FILE_BYTES) { skipped.big++; continue; }
+      let dest = join(destDir, p);
+      let blocked = isDir(dest);
+      for (let d = dirname(dest); d && !blocked; d = dirname(d)) if (W.has(d)) blocked = true;
+      if (blocked) { skipped.clash++; continue; }
+      if (W.has(dest) || plan.has(dest)) {
+        const v = await askConflict(basename(dest), state, list.length > 1);
+        if (v === 'stop') break;
+        if (v === 'skip') continue;
+        if (v === 'both') { const dd = dirname(dest); let n = uniqueName(dd, basename(dest)); while (plan.has(join(dd, n))) n = uniqueName(dd, `${n}`); dest = join(dd, n); }
+      }
+      plan.set(dest, file);
+    }
+    if (plan.size) {
+      mutate(`Add ${plan.size === 1 ? `“${basename([...plan.keys()][0])}”` : plural(plan.size, 'file')}`, () => { for (const [d, f] of plan) setW(d, newEntry(f)); });
+      if (destDir !== S.cwd) for (let d = destDir; d; d = dirname(d)) S.exp.add(d);
+      const top = [...plan.keys()].map((k) => k.slice(destDir ? destDir.length + 1 : 0).split('/')[0]).map((n) => join(destDir, n));
+      if (destDir === S.cwd) { S.sel = new Set(top); S.anchor = top[0]; ui.all(); }
+    }
+    const notes = [];
+    if (skipped.big) notes.push(`${plural(skipped.big, 'file')} over 100 MB`);
+    if (skipped.bad) notes.push(`${plural(skipped.bad, 'item')} with invalid names`);
+    if (skipped.junk) notes.push(`${plural(skipped.junk, 'junk file')}`);
+    if (skipped.clash) notes.push(`${plural(skipped.clash, 'file')} clashing with a folder`);
+    toast(`${plan.size ? `Added ${plural(plan.size, 'file')} to ${destDir ? `“${basename(destDir)}”` : S.repo.name}. ` : ''}${notes.length ? `Skipped ${notes.join(', ')}.` : ''}`.trim() || 'Nothing to add.', { type: notes.length && !plan.size ? 'warn' : 'info', action: plan.size ? { label: 'Undo', fn: undo } : null, ms: 5000 });
+  }
+
+  /* reading dropped / picked files */
+  async function readEntry(entry, prefix) {
+    const out = [];
+    if (entry.isFile) {
+      const file = await new Promise((res, rej) => entry.file(res, rej));
+      out.push({ path: prefix + entry.name, file });
+    } else if (entry.isDirectory) {
+      const reader = entry.createReader();
+      let batch;
+      do {
+        batch = await new Promise((res, rej) => reader.readEntries(res, rej));
+        for (const child of batch) out.push(...(await readEntry(child, `${prefix}${entry.name}/`)));
+      } while (batch.length);
+    }
+    return out;
+  }
+  async function filesFromDrop(dt) {
+    const entries = Array.from(dt.items || []).filter((i) => i.kind === 'file').map((i) => (i.webkitGetAsEntry ? i.webkitGetAsEntry() : null)).filter(Boolean); // must run synchronously during the drop
+    if (!entries.length) return Array.from(dt.files || []).map((f) => ({ path: f.name, file: f }));
+    const all = [];
+    for (const e of entries) all.push(...(await readEntry(e, '')));
+    return all;
+  }
+  const filesFromInput = (fl) => Array.from(fl).map((f) => ({ path: f.webkitRelativePath || f.name, file: f }));
+  async function externalDrop(dt, destDir) {
+    const pending = filesFromDrop(dt);
+    toast('Reading files…', { id: 'read', ms: 1200 });
+    if (!S.open || S.min || !S.repo) await openPanel();
+    if (S.loading) { for (let i = 0; i < 200 && S.loading; i++) await sleep(100); }
+    if (!S.repo) return;
+    try { const list = await pending; await addUploads(list, destDir == null ? S.cwd : destDir); } catch (_) { toast('Could not read the dropped items.', { type: 'err' }); }
+  }
+
+  /* ───────────────────────── content access ───────────────────────── */
+  async function getBytes(e) {
+    if (e.file) return new Uint8Array(await e.file.arrayBuffer());
+    if (e.text != null) return new TextEncoder().encode(e.text);
+    if (!e.sha) throw new Error('This file has no content yet.');
+    const c = BC.get(e.sha);
+    if (c) return c;
+    const buf = await api('GET', `/repos/${S.repo.owner}/${S.repo.name}/git/blobs/${e.sha}`, null, { raw: true });
+    const u8 = new Uint8Array(buf);
+    if (u8.length < 3e6) { BC.set(e.sha, u8); if (BC.size > 80) BC.delete(BC.keys().next().value); }
+    return u8;
+  }
+  const toB64 = (file) => new Promise((res, rej) => { const fr = new FileReader(); fr.onload = () => res(String(fr.result).split(',')[1] || ''); fr.onerror = () => rej(fr.error || new Error(`Could not read ${file.name}`)); fr.readAsDataURL(file); });
+  const PV = new Map();
+  async function loadPreview(path, e) {
+    const key = `${path}|${e.sha || ''}|${e.size}|${e.dirty ? 'd' : ''}`;
+    if (PV.has(key)) return PV.get(key);
+    const ext = extOf(basename(path));
+    let r;
+    try {
+      if (IMG_MIME[ext]) {
+        if (e.size > MAX_IMG_PREVIEW) r = { kind: 'none', why: 'Too large to preview' };
+        else r = { kind: 'image', url: URL.createObjectURL(new Blob([await getBytes(e)], { type: IMG_MIME[ext] })) };
+      } else if (e.type === 'commit') r = { kind: 'none', why: 'Submodule' };
+      else if (BIN_EXT.has(ext) || e.size > MAX_TEXT_PREVIEW) r = { kind: 'none', why: e.size > MAX_TEXT_PREVIEW && !BIN_EXT.has(ext) ? 'Too large to preview' : 'No preview available' };
+      else {
+        const u8 = await getBytes(e);
+        if (u8.subarray(0, 8000).includes(0)) r = { kind: 'none', why: 'Binary file' };
+        else r = { kind: 'text', text: new TextDecoder('utf-8').decode(u8) };
+      }
+    } catch (err) { r = { kind: 'none', why: friendly(err) }; }
+    PV.set(key, r);
+    return r;
+  }
+
+  /* ───────────────────────── download (file or ZIP) ───────────────────────── */
+  const CRC = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+  const crc32 = (u8) => { let c = -1; for (let i = 0; i < u8.length; i++) c = CRC[(c ^ u8[i]) & 255] ^ (c >>> 8); return (c ^ -1) >>> 0; };
+  function makeZip(files) {
+    const enc = new TextEncoder();
+    const parts = []; const cen = []; let off = 0;
+    const d = new Date();
+    const dt = (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1);
+    const dd = ((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate();
+    for (const f of files) {
+      const nm = enc.encode(f.name); const crc = crc32(f.data); const sz = f.data.length;
+      const lh = new DataView(new ArrayBuffer(30));
+      lh.setUint32(0, 0x04034b50, true); lh.setUint16(4, 20, true); lh.setUint16(6, 0x0800, true); lh.setUint16(10, dt, true); lh.setUint16(12, dd, true);
+      lh.setUint32(14, crc, true); lh.setUint32(18, sz, true); lh.setUint32(22, sz, true); lh.setUint16(26, nm.length, true);
+      parts.push(lh.buffer, nm, f.data);
+      const ch = new DataView(new ArrayBuffer(46));
+      ch.setUint32(0, 0x02014b50, true); ch.setUint16(4, 20, true); ch.setUint16(6, 20, true); ch.setUint16(8, 0x0800, true); ch.setUint16(12, dt, true); ch.setUint16(14, dd, true);
+      ch.setUint32(16, crc, true); ch.setUint32(20, sz, true); ch.setUint32(24, sz, true); ch.setUint16(28, nm.length, true); ch.setUint32(42, off, true);
+      cen.push(ch.buffer, nm);
+      off += 30 + nm.length + sz;
+    }
+    const cdSize = cen.reduce((a, b) => a + b.byteLength, 0);
+    const end = new DataView(new ArrayBuffer(22));
+    end.setUint32(0, 0x06054b50, true); end.setUint16(8, files.length, true); end.setUint16(10, files.length, true); end.setUint32(12, cdSize, true); end.setUint32(16, off, true);
+    return new Blob([...parts, ...cen, end.buffer], { type: 'application/zip' });
+  }
+  function saveBlob(blob, name) {
+    const url = URL.createObjectURL(blob);
+    const a = h('a', { href: url, download: name });
+    document.body.append(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+  }
+  async function downloadItems(paths) {
+    paths = topLevel(paths);
+    if (!paths.length) return;
+    try {
+      if (paths.length === 1 && W.has(paths[0])) {
+        const p = paths[0];
+        toast(`Downloading “${basename(p)}”…`, { id: 'dl', ms: 1500 });
+        saveBlob(new Blob([await getBytes(W.get(p))]), basename(p));
+        return;
+      }
+      await prepare(paths);
+      const base = paths.length === 1 ? dirname(paths[0]) : S.cwd;
+      const files = [];
+      for (const p of paths) for (const k of under(p)) files.push(k);
+      let done = 0;
+      const out = new Array(files.length);
+      toast(`Preparing ZIP… 0 / ${files.length}`, { id: 'dl', sticky: true });
+      await pool(files, CONCURRENCY, async (k, i) => {
+        out[i] = { name: base ? k.slice(base.length + 1) : k, data: await getBytes(W.get(k)) };
+        toast(`Preparing ZIP… ${++done} / ${files.length}`, { id: 'dl', sticky: true });
+      });
+      const zname = paths.length === 1 ? basename(paths[0]) : `${S.repo.name}-${paths.length}-items`;
+      saveBlob(makeZip(out), `${zname}.zip`);
+      toast(`Saved ${zname}.zip (${plural(files.length, 'file')}).`, { id: 'dl', ms: 3500 });
+    } catch (e) { toast(friendly(e), { id: 'dl', type: 'err' }); }
+  }
+
+  /* ───────────────────────── links & clipboard ───────────────────────── */
+  const ghUrl = (p, dir, ref) => { const { owner, name } = S.repo; return p ? `https://github.com/${owner}/${name}/${dir ? 'tree' : 'blob'}/${encRef(ref || S.branch)}/${encRef(p)}` : `https://github.com/${owner}/${name}/tree/${encRef(ref || S.branch)}`; };
+  const rawUrl = (p) => `https://raw.githubusercontent.com/${S.repo.owner}/${S.repo.name}/${encRef(S.branch)}/${encRef(p)}`;
+  function copyText(text, msg) {
+    const done = () => toast(msg || 'Copied to clipboard.');
+    try { if (typeof GM_setClipboard === 'function') { GM_setClipboard(text, 'text'); return done(); } } catch (_) { /* fall through */ }
+    if (navigator.clipboard) navigator.clipboard.writeText(text).then(done, () => toast('Could not copy.', { type: 'err' }));
+    else toast('Could not copy.', { type: 'err' });
+  }
+  function copyLink(kind, paths) {
+    const list = paths.length ? paths : [S.cwd];
+    const urls = list.map((p) => {
+      const dir = isDir(p);
+      if (kind === 'path') return p || '/';
+      if (kind === 'raw') return dir ? ghUrl(p, true) : rawUrl(p);
+      if (kind === 'perma') return ghUrl(p, dir, S.headSha);
+      return ghUrl(p, dir);
+    });
+    const fresh = list.some((p) => chg().st.has(p) || chg().dirty.has(p));
+    copyText(urls.join('\n'), fresh && kind !== 'path' ? 'Link copied. It works after you commit.' : (kind === 'path' ? 'Path copied.' : `${plural(urls.length, 'link')} copied.`));
+  }
+  const openOnGitHub = (p) => window.open(ghUrl(p, isDir(p)), '_blank', 'noopener');
+
+  /* ───────────────────────── commit ───────────────────────── */
+  function defaultMessage() {
+    const c = chg();
+    if (c.total === 1) {
+      if (c.adds.length) return `Add ${basename(c.adds[0])}`;
+      if (c.mods.length) return `Update ${basename(c.mods[0])}`;
+      if (c.copies.length) return `Copy ${basename(c.copies[0])}`;
+      if (c.moves.length) { const p = c.moves[0]; const f = W.get(p).from; return f && dirname(f) === dirname(p) ? `Rename ${basename(f)} to ${basename(p)}` : `Move ${basename(p)}`; }
+      return `Delete ${basename(c.dels[0])}`;
+    }
+    return [c.adds.length && `Add ${c.adds.length}`, c.mods.length && `Update ${c.mods.length}`, c.moves.length && `Move ${c.moves.length}`, c.copies.length && `Copy ${c.copies.length}`, c.dels.length && `Delete ${c.dels.length}`].filter(Boolean).join(', ') + ' files';
+  }
+
+  async function runCommit({ msg, mode, newBranch }, prog) {
+    const c = chg();
+    const { owner, name } = S.repo;
+    const base = `/repos/${owner}/${name}`;
+    const branch = S.branch;
+    onWait = (s) => prog.note(`GitHub asked us to slow down. Continuing in ${s}s…`);
+    try {
+      prog.step(0);
+      const ref = await api('GET', `${base}/git/ref/heads/${encRef(branch)}`);
+      const headSha = ref.object.sha;
+      if (headSha !== S.headSha) {
+        const r = await dialog({ title: 'The branch has new commits', msg: `“${branch}” changed on GitHub after you opened it. Committing now builds on the newest version, and files you moved or deleted may overwrite newer edits.`, buttons: [{ label: 'Cancel', value: null }, { label: 'Commit Anyway', value: 'go', primary: true }] });
+        if (!r.value) return { cancelled: true };
+      }
+      const head = await api('GET', `${base}/git/commits/${headSha}`);
+      const uploads = [...c.adds, ...c.mods];
+      const shas = new Map();
+      let done = 0;
+      prog.step(1, 0, `0 / ${uploads.length}`);
+      await pool(uploads, CONCURRENCY, async (p) => {
+        const e = W.get(p);
+        const body = e.text != null ? { content: e.text, encoding: 'utf-8' } : { content: await toB64(e.file), encoding: 'base64' };
+        const b = await api('POST', `${base}/git/blobs`, body);
+        shas.set(p, b.sha);
+        prog.step(1, ++done / uploads.length, `${done} / ${uploads.length}`);
+      });
+      prog.step(2);
+      const entries = [];
+      for (const p of c.dels) { const b = B.blobs.get(p); entries.push({ path: p, mode: b.mode, type: b.type, sha: null }); }
+      for (const p of [...c.moves, ...c.copies]) { const e = W.get(p); entries.push({ path: p, mode: e.mode, type: e.type, sha: e.sha }); }
+      for (const p of uploads) { const e = W.get(p); entries.push({ path: p, mode: e.mode || '100644', type: 'blob', sha: shas.get(p) }); }
+      let baseTree = head.tree.sha;
+      for (let i = 0; i < entries.length; i += TREE_CHUNK) {
+        const t = await api('POST', `${base}/git/trees`, { base_tree: baseTree, tree: entries.slice(i, i + TREE_CHUNK) });
+        baseTree = t.sha;
+        prog.step(2, Math.min(1, (i + TREE_CHUNK) / entries.length));
+      }
+      prog.step(3);
+      const commit = await api('POST', `${base}/git/commits`, { message: msg, tree: baseTree, parents: [headSha] });
+      prog.step(4);
+      let finalBranch = branch;
+      if (mode === 'new') { await api('POST', `${base}/git/refs`, { ref: `refs/heads/${newBranch}`, sha: commit.sha }); finalBranch = newBranch; }
+      else await api('PATCH', `${base}/git/refs/heads/${encRef(branch)}`, { sha: commit.sha });
+      prog.step(5);
+      return { sha: commit.sha, branch: finalBranch, mode, count: c.total };
+    } finally { onWait = null; }
+  }
+
+  /* ───────────────────────── styles ───────────────────────── */
+  const CSS = `
+:host{all:initial}
+*,*::before,*::after{box-sizing:border-box}
+.root{--font:-apple-system,BlinkMacSystemFont,"SF Pro Text","Inter","Segoe UI",system-ui,sans-serif;--mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;font:13px/1.4 var(--font);color:var(--fg);-webkit-font-smoothing:antialiased}
+.root[data-theme=light]{--win:#fff;--side:rgba(236,236,240,.8);--bar:rgba(246,246,248,.86);--fg:#1d1d1f;--fg2:#6e6e73;--fg3:#a1a1a6;--line:rgba(0,0,0,.11);--line2:rgba(0,0,0,.06);--hover:rgba(0,0,0,.055);--hover2:rgba(0,0,0,.1);--stripe:rgba(0,0,0,.028);--acc:#0a60ff;--accsoft:rgba(10,96,255,.14);--accring:rgba(10,96,255,.32);--selsoft:rgba(0,0,0,.09);--menu:rgba(250,250,252,.82);--input:#fff;--pop:#fff;--green:#1c9c3f;--orange:#c46a00;--blue:#0a60ff;--purple:#8a3fd1;--red:#d70015;--shadow:0 30px 90px rgba(0,0,0,.38),0 0 0 .5px rgba(0,0,0,.28)}
+.root[data-theme=dark]{--win:#1e1e20;--side:rgba(46,46,50,.78);--bar:rgba(52,52,56,.86);--fg:#f5f5f7;--fg2:#a1a1a6;--fg3:#6e6e73;--line:rgba(255,255,255,.12);--line2:rgba(255,255,255,.07);--hover:rgba(255,255,255,.075);--hover2:rgba(255,255,255,.13);--stripe:rgba(255,255,255,.03);--acc:#0a84ff;--accsoft:rgba(10,132,255,.22);--accring:rgba(10,132,255,.45);--selsoft:rgba(255,255,255,.14);--menu:rgba(52,52,56,.82);--input:#2a2a2d;--pop:#2c2c2e;--green:#32d74b;--orange:#ff9f0a;--blue:#4da3ff;--purple:#bf5af2;--red:#ff453a;--shadow:0 30px 90px rgba(0,0,0,.65),0 0 0 .5px rgba(255,255,255,.2)}
+button,input,textarea{font:inherit;color:inherit}
+button{cursor:default;border:0;background:none;padding:0}
+.ico,.fico{display:inline-flex;flex:none}
+.fico svg{display:block;filter:drop-shadow(0 1px 1.5px rgba(0,0,0,.22))}
+.muted{color:var(--fg2)}
+
+.fab{position:fixed;left:20px;bottom:20px;z-index:2147482990;display:none;align-items:center;gap:9px;height:40px;padding:0 16px 0 12px;border:.5px solid var(--line);border-radius:20px;background:var(--bar);backdrop-filter:blur(24px) saturate(180%);color:var(--fg);font-weight:600;box-shadow:0 8px 28px rgba(0,0,0,.28);cursor:pointer;transition:transform .18s cubic-bezier(.2,.9,.3,1.2)}
+.fab.show{display:inline-flex}
+.fab:hover{transform:translateY(-2px) scale(1.03)}
+.fab .badge{min-width:18px;height:18px;padding:0 5px;border-radius:9px;background:var(--orange);color:#fff;font-size:11px;line-height:18px;text-align:center}
+.scrim{position:fixed;inset:0;z-index:2147483000;background:rgba(0,0,0,.34);backdrop-filter:blur(3px) saturate(115%);opacity:0;pointer-events:none;transition:opacity .22s}
+.scrim.show{opacity:1;pointer-events:auto}
+
+.win{position:fixed;z-index:2147483001;display:none;min-width:640px;min-height:420px;border-radius:12px;overflow:hidden;background:var(--win);box-shadow:var(--shadow);transform-origin:12% 100%}
+.win.show{display:flex;animation:winIn .26s cubic-bezier(.2,.9,.3,1.08)}
+.win.out{display:flex;animation:winOut .2s ease-in forwards}
+.win.max{border-radius:0}
+@keyframes winIn{from{opacity:0;transform:scale(.94) translateY(10px)}to{opacity:1;transform:none}}
+@keyframes winOut{to{opacity:0;transform:scale(.6) translate(-30%,40%)}}
+
+.lights{position:absolute;left:16px;top:19px;z-index:20;display:flex;gap:8px}
+.lights button{position:relative;width:12px;height:12px;border-radius:50%;box-shadow:inset 0 0 0 .5px rgba(0,0,0,.22)}
+.lights .r{background:#ff5f57}.lights .y{background:#febc2e}.lights .g{background:#28c840}
+.lights button svg{position:absolute;inset:0;margin:auto;opacity:0;transition:opacity .1s}
+.lights:hover button svg{opacity:.75}
+
+.sb{display:flex;flex-direction:column;width:224px;flex:none;background:var(--side);backdrop-filter:blur(30px) saturate(180%);border-right:.5px solid var(--line);transition:margin .25s cubic-bezier(.2,.9,.3,1)}
+.win.no-sb .sb{margin-left:-224px}
+.sb-top{height:52px;flex:none}
+.sb-scroll{flex:1;overflow:auto;padding:0 10px 10px}
+.sb-h{padding:12px 8px 4px;font-size:11px;font-weight:600;color:var(--fg3)}
+.sbr{display:flex;align-items:center;gap:6px;height:26px;padding:0 6px 0 4px;border-radius:6px;color:var(--fg);cursor:default;position:relative}
+.sbr:hover{background:var(--hover)}
+.sbr.on{background:var(--selsoft)}
+.sbr.dt,.lr.dt,.ic.dt .ic-img,.crumb.dt{background:var(--acc)!important;color:#fff!important;border-radius:6px}
+.sbr .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sbr .tri{width:14px;height:14px;display:grid;place-items:center;color:var(--fg3);flex:none;transition:transform .15s}
+.sbr .tri.open,.lr .tri.open{transform:rotate(90deg)}
+.sbr .tri-sp{width:14px;flex:none}
+.sbr .add{display:none;width:20px;height:20px;border-radius:5px;place-items:center;color:var(--fg2)}
+.sbr:hover .add{display:grid}
+.sbr .add:hover{background:var(--hover2);color:var(--fg)}
+.sbr .cnt{min-width:18px;height:18px;padding:0 6px;border-radius:9px;background:var(--orange);color:#fff;font-size:11px;font-weight:600;line-height:18px;text-align:center}
+.sbr .ico{color:var(--acc)}
+.sbr svg{display:block}
+.sb-foot{flex:none;padding:8px 10px 10px;border-top:.5px solid var(--line2)}
+
+.rt{flex:1;min-width:0;display:flex;flex-direction:column}
+.win.no-sb .tb{padding-left:84px}
+.tb{display:flex;align-items:center;gap:6px;height:52px;flex:none;padding:0 12px;background:var(--bar);backdrop-filter:blur(30px) saturate(180%);border-bottom:.5px solid var(--line);user-select:none}
+.tbtn{display:grid;place-items:center;width:30px;height:28px;border-radius:6px;color:var(--fg2);transition:background .12s}
+.tbtn:hover:not([disabled]){background:var(--hover);color:var(--fg)}
+.tbtn:active:not([disabled]){background:var(--hover2)}
+.tbtn.on{background:var(--hover2);color:var(--fg)}
+.tbtn[disabled]{opacity:.32}
+.tb-title{display:flex;align-items:center;gap:8px;min-width:0;margin-left:6px;font-weight:600;font-size:14px}
+.tb-title .t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:260px}
+.chip{display:inline-flex;align-items:center;gap:5px;height:22px;padding:0 8px;border-radius:11px;background:var(--hover);color:var(--fg2);font-size:12px;font-weight:500;white-space:nowrap}
+.chip:hover{background:var(--hover2);color:var(--fg)}
+.sp{flex:1;min-width:8px}
+.seg{position:relative;display:flex;height:28px;padding:2px;border-radius:7px;background:var(--hover)}
+.seg button{position:relative;z-index:1;display:grid;place-items:center;width:34px;border-radius:5px;color:var(--fg2)}
+.seg button.on{color:var(--fg)}
+.seg .thumb{position:absolute;top:2px;left:2px;width:34px;height:24px;border-radius:5px;background:var(--pop);box-shadow:0 .5px 2px rgba(0,0,0,.25);transition:transform .22s cubic-bezier(.3,1.2,.4,1)}
+.seg[data-v=list] .thumb{transform:translateX(34px)}
+.plus{width:28px;height:28px;border-radius:50%;background:var(--acc);color:#fff;display:grid;place-items:center;box-shadow:0 1px 3px rgba(0,0,0,.3);transition:transform .15s,filter .15s}
+.plus:hover{filter:brightness(1.12);transform:scale(1.07)}
+.plus:active{transform:scale(.94)}
+.pill{display:flex;align-items:center;gap:4px;height:28px;padding:0 3px 0 10px;border-radius:14px;background:rgba(255,159,10,.16);color:var(--orange);font-weight:600;font-size:12px;white-space:nowrap;animation:pillIn .3s cubic-bezier(.2,.9,.3,1.3)}
+.pill .go{height:22px;padding:0 10px;border-radius:11px;background:var(--orange);color:#fff;font-weight:600}
+.pill .go:hover{filter:brightness(1.1)}
+@keyframes pillIn{from{opacity:0;transform:scale(.8)}}
+.search{display:flex;align-items:center;gap:6px;width:160px;height:28px;padding:0 8px;border-radius:7px;background:var(--hover);color:var(--fg2);transition:width .22s cubic-bezier(.2,.9,.3,1),background .15s,box-shadow .15s}
+.search:focus-within{width:230px;background:var(--input);box-shadow:0 0 0 3.5px var(--accring)}
+.search input{flex:1;min-width:0;border:0;outline:0;background:transparent;color:var(--fg)}
+.search input::placeholder{color:var(--fg3)}
+.win.narrow .hide-n{display:none}
+.win.narrow .insp{display:none}
+
+.mid{flex:1;display:flex;min-height:0}
+.main{flex:1;min-width:0;display:flex;flex-direction:column}
+.content{position:relative;flex:1;overflow:auto;background:var(--win);outline:0}
+.content.dt-bg{box-shadow:inset 0 0 0 3px var(--acc)}
+.insp{width:272px;flex:none;overflow:auto;border-left:.5px solid var(--line);background:var(--win);transition:margin .25s cubic-bezier(.2,.9,.3,1)}
+.win.no-insp .insp{margin-right:-272px}
+.path{display:flex;align-items:center;gap:2px;height:30px;flex:none;padding:0 12px;border-top:.5px solid var(--line);background:var(--win);font-size:12px;color:var(--fg2)}
+.crumbs{display:flex;align-items:center;gap:1px;min-width:0;flex:1;overflow:hidden}
+.crumb{display:inline-flex;align-items:center;gap:5px;height:20px;padding:0 5px;border-radius:5px;white-space:nowrap;cursor:default}
+.crumb:hover{background:var(--hover)}
+.crumb.last{color:var(--fg);font-weight:500}
+.crumbs .sep{color:var(--fg3);display:inline-flex}
+.stat{flex:none;margin-left:12px;white-space:nowrap}
+
+/* list view */
+.lh,.lr{display:grid;grid-template-columns:minmax(180px,1fr) 170px 90px;align-items:center}
+.lh{position:sticky;top:0;z-index:2;height:26px;background:var(--win);border-bottom:.5px solid var(--line);font-size:12px;color:var(--fg2);user-select:none}
+.lh>div{display:flex;align-items:center;gap:4px;height:100%;padding:0 10px;border-left:.5px solid var(--line2)}
+.lh>div:first-child{padding-left:34px;border-left:0}
+.lh>div:hover{color:var(--fg)}
+.lh .on{color:var(--fg);font-weight:600}
+.lr{height:26px;color:var(--fg);content-visibility:auto;contain-intrinsic-size:26px}
+.lr:nth-child(even){background:var(--stripe)}
+.lr .c-name{display:flex;align-items:center;gap:6px;min-width:0;padding-right:8px}
+.lr .nm{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lr .where{color:var(--fg3);font-size:12px;margin-left:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lr .c-kind,.lr .c-size{padding:0 10px;color:var(--fg2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lr .c-size{text-align:right;font-variant-numeric:tabular-nums}
+.lr .tri{width:14px;height:14px;display:grid;place-items:center;color:var(--fg3);flex:none;transition:transform .15s}
+.lr .tri-sp{width:14px;flex:none}
+.lr.sel{background:var(--acc);color:#fff}
+.lr.sel .c-kind,.lr.sel .c-size,.lr.sel .tri,.lr.sel .where{color:rgba(255,255,255,.82)}
+.lr.cut,.ic.cut{opacity:.45}
+.tag{flex:none;height:16px;padding:0 6px;border-radius:8px;font-size:10.5px;font-weight:600;line-height:16px;margin-left:4px}
+.t-new{background:rgba(48,209,88,.2);color:var(--green)}.t-mod{background:rgba(255,159,10,.22);color:var(--orange)}.t-move{background:var(--accsoft);color:var(--blue)}.t-copy{background:rgba(191,90,242,.2);color:var(--purple)}
+.lr.sel .tag{background:rgba(255,255,255,.25);color:#fff}
+.dot{flex:none;width:7px;height:7px;border-radius:50%;background:var(--orange);margin-left:5px}
+
+/* icon view */
+.icons{display:grid;grid-template-columns:repeat(auto-fill,minmax(104px,1fr));gap:6px 4px;padding:14px 14px 24px;align-content:start}
+.ic{position:relative;display:flex;flex-direction:column;align-items:center;gap:5px;padding:4px 2px;min-width:0}
+.ic-img{position:relative;display:grid;place-items:center;width:76px;height:68px;border-radius:9px}
+.ic.sel .ic-img{background:var(--selsoft)}
+.ic-name{max-width:100%;text-align:center;font-size:12px;line-height:1.25;word-break:break-word;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.ic-name span{padding:0 5px;border-radius:4px}
+.ic.sel .ic-name span{background:var(--acc);color:#fff}
+.ic .tag,.ic .dot{position:absolute;top:2px;right:2px;margin:0}
+.ic .dot{top:6px;right:8px}
+.rn{width:100%;min-width:60px;padding:1px 4px;border:0;border-radius:4px;outline:2px solid var(--acc);background:var(--input);color:var(--fg);font:inherit;text-align:inherit}
+.ic .rn{text-align:center}
+.marq{position:absolute;z-index:4;border:1px solid var(--acc);background:var(--accsoft);border-radius:3px;pointer-events:none}
+
+.empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;height:100%;min-height:240px;padding:24px;text-align:center;color:var(--fg2)}
+.empty h3{margin:0;font-size:17px;font-weight:600;color:var(--fg)}
+.empty p{margin:0;max-width:40ch}
+.empty .big{opacity:.9;margin-bottom:6px}
+.spin{width:18px;height:18px;border:2px solid var(--line);border-top-color:var(--acc);border-radius:50%;animation:spin .7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* inspector */
+.ip{padding:18px 16px 24px;display:flex;flex-direction:column;gap:14px}
+.ip-prev{display:grid;place-items:center;min-height:130px;max-height:260px;border-radius:10px;background:var(--stripe);overflow:hidden}
+.ip-prev img{max-width:100%;max-height:260px;display:block;object-fit:contain}
+.ip-prev pre{margin:0;align-self:stretch;width:100%;max-height:260px;overflow:hidden;padding:10px;font:11px/1.45 var(--mono);color:var(--fg2);white-space:pre;text-align:left}
+.ip-name{font-size:15px;font-weight:600;word-break:break-all;text-align:center}
+.ip-sub{font-size:12px;color:var(--fg2);text-align:center;margin-top:-10px}
+.ip-rows{display:flex;flex-direction:column;border-top:.5px solid var(--line2)}
+.ip-row{display:flex;justify-content:space-between;gap:12px;padding:6px 0;border-bottom:.5px solid var(--line2);font-size:12px}
+.ip-row span:first-child{color:var(--fg2);flex:none}
+.ip-row span:last-child{text-align:right;word-break:break-all;min-width:0}
+.ip-act{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.xbtn{display:inline-flex;align-items:center;justify-content:center;gap:6px;height:26px;padding:0 10px;border-radius:6px;background:var(--hover);font-weight:500;font-size:12.5px;white-space:nowrap}
+.xbtn:hover:not([disabled]){background:var(--hover2)}
+.xbtn.pri{background:var(--acc);color:#fff}.xbtn.pri:hover{filter:brightness(1.1)}
+.xbtn.dng{color:var(--red)}
+.xbtn[disabled]{opacity:.4}
+
+/* menus, toasts */
+.layer{position:fixed;inset:0;z-index:2147483005;pointer-events:none}
+.menu{position:fixed;min-width:230px;padding:5px;border-radius:10px;background:var(--menu);backdrop-filter:blur(30px) saturate(180%);border:.5px solid var(--line);box-shadow:0 14px 44px rgba(0,0,0,.3);pointer-events:auto;animation:menuIn .12s ease-out;font-size:13px;max-height:calc(100vh - 20px);overflow:auto}
+.menu .menu{position:absolute;left:calc(100% - 2px);top:-6px;display:none;animation:none}
+.flip .menu .menu{left:auto;right:calc(100% - 2px)}
+.m-it:hover>.menu{display:block}
+@keyframes menuIn{from{opacity:0;transform:scale(.97)}}
+.m-it{position:relative;display:flex;align-items:center;height:24px;padding:0 8px 0 4px;border-radius:5px;white-space:nowrap}
+.m-it:hover:not(.dis){background:var(--acc);color:#fff}
+.m-it.dis{opacity:.4}.m-it.danger{color:var(--red)}.m-it.danger:hover{color:#fff}
+.m-ck{width:18px;text-align:center;font-size:12px;flex:none}
+.m-l{flex:1;padding-right:18px}
+.m-k{color:var(--fg2);font-size:12px;letter-spacing:.04em}
+.m-it:hover:not(.dis) .m-k{color:rgba(255,255,255,.8)}
+.m-sep{height:.5px;margin:5px 8px;background:var(--line)}
+.m-hd{padding:4px 8px 2px 22px;font-size:11px;font-weight:600;color:var(--fg3)}
+.toasts{position:fixed;top:16px;right:16px;z-index:2147483010;display:flex;flex-direction:column;gap:8px;align-items:flex-end;pointer-events:none}
+.toast{display:flex;align-items:center;gap:10px;max-width:380px;padding:10px 12px 10px 14px;border-radius:12px;background:var(--menu);backdrop-filter:blur(30px) saturate(180%);border:.5px solid var(--line);box-shadow:0 10px 36px rgba(0,0,0,.3);pointer-events:auto;font-size:13px;animation:toastIn .3s cubic-bezier(.2,.9,.3,1.2)}
+.toast.err{border-color:var(--red)}.toast.warn{border-color:var(--orange)}
+.toast.out{animation:toastOut .2s ease-in forwards}
+.toast .ta{flex:none;height:24px;padding:0 10px;border-radius:6px;background:var(--hover2);font-weight:600;font-size:12px}
+.toast .ta:hover{background:var(--acc);color:#fff}
+@keyframes toastIn{from{opacity:0;transform:translateX(30px) scale(.96)}}
+@keyframes toastOut{to{opacity:0;transform:translateX(30px)}}
+
+/* sheets & dialogs */
+.sheet-layer,.dlg-layer,.ql-layer{position:absolute;inset:0;display:none;z-index:30}
+.sheet-layer{background:rgba(0,0,0,.22);justify-content:center;align-items:flex-start}
+.sheet-layer.show,.dlg-layer.show,.ql-layer.show{display:flex}
+.dlg-layer{z-index:40;background:rgba(0,0,0,.28);align-items:center;justify-content:center}
+.ql-layer{z-index:35;background:rgba(0,0,0,.45);backdrop-filter:blur(8px);align-items:center;justify-content:center;padding:28px}
+.sheet{display:flex;flex-direction:column;width:min(600px,94%);max-height:88%;border-radius:0 0 14px 14px;background:var(--pop);box-shadow:0 20px 70px rgba(0,0,0,.5),0 0 0 .5px var(--line);overflow:hidden;animation:drop .34s cubic-bezier(.2,.9,.3,1)}
+.sheet.wide{width:min(940px,95%);height:88%}
+@keyframes drop{from{transform:translateY(-102%)}}
+.dlg{width:min(380px,92%);padding:20px 20px 16px;border-radius:14px;background:var(--pop);box-shadow:0 20px 70px rgba(0,0,0,.5),0 0 0 .5px var(--line);animation:pop .2s cubic-bezier(.2,.9,.3,1.2)}
+@keyframes pop{from{opacity:0;transform:scale(.92)}}
+.dlg h4{margin:0 0 6px;font-size:14px;font-weight:600;text-align:center}
+.dlg p{margin:0 0 12px;text-align:center;color:var(--fg2);font-size:12.5px;white-space:pre-line}
+.dlg-in{width:100%;height:28px;margin-bottom:12px;padding:0 9px;border:.5px solid var(--line);border-radius:6px;background:var(--input);outline:0}
+.dlg-in:focus{box-shadow:0 0 0 3.5px var(--accring);border-color:var(--acc)}
+.dlg label{display:flex;align-items:center;gap:6px;justify-content:center;margin-bottom:12px;font-size:12.5px;color:var(--fg2)}
+.dbtns{display:flex;gap:8px;justify-content:center;flex-wrap:wrap}
+.dbtn{flex:1;min-width:70px;height:26px;padding:0 12px;border-radius:6px;background:var(--hover2);font-weight:500}
+.dbtn:hover{filter:brightness(.96)}
+.dbtn.primary{background:var(--acc);color:#fff}.dbtn.danger{background:var(--red);color:#fff}
+.sh-h{display:flex;align-items:center;gap:12px;padding:16px 18px 12px}
+.sh-h .big{width:40px;height:40px;border-radius:10px;display:grid;place-items:center;background:var(--accsoft);color:var(--acc);flex:none}
+.sh-t{font-size:15px;font-weight:600}.sh-s{font-size:12px;color:var(--fg2)}
+.sh-b{flex:1;min-height:0;overflow:auto;padding:2px 18px 14px;display:flex;flex-direction:column;gap:12px}
+.sh-f{display:flex;align-items:center;gap:8px;padding:12px 18px;border-top:.5px solid var(--line2);background:var(--stripe)}
+.sh-f .sum{flex:1;min-width:0;font-size:12px;color:var(--fg2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.fld{display:flex;flex-direction:column;gap:5px}
+.fld .l{font-size:12px;font-weight:600;color:var(--fg2)}
+.inp{height:28px;padding:0 9px;border:.5px solid var(--line);border-radius:6px;background:var(--input);outline:0;width:100%}
+.inp:focus{box-shadow:0 0 0 3.5px var(--accring);border-color:var(--acc)}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chg{border:.5px solid var(--line);border-radius:9px;max-height:220px;overflow:auto}
+.cr{display:flex;align-items:center;gap:8px;padding:4px 10px;font-size:12px;border-bottom:.5px solid var(--line2)}
+.cr:last-child{border-bottom:0}
+.cr .p{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cr .del{text-decoration:line-through;color:var(--fg2)}
+.cr .arrow{color:var(--fg3)}
+.opt{display:flex;align-items:flex-start;gap:9px;padding:9px 11px;border:.5px solid var(--line);border-radius:9px}
+.opt.on{border-color:var(--acc);background:var(--accsoft)}
+.opt input[type=radio]{margin-top:3px;accent-color:var(--acc)}
+.opt .ct{font-weight:600}.opt .cs{font-size:12px;color:var(--fg2)}
+.opt .inp{margin-top:7px}
+.bar{height:6px;border-radius:3px;background:var(--hover2);overflow:hidden}
+.bar i{display:block;height:100%;width:0;background:var(--acc);transition:width .25s}
+.steps{display:flex;flex-direction:column;gap:2px}
+.step{display:flex;align-items:center;gap:10px;padding:5px 0;color:var(--fg2)}
+.step .d{display:grid;place-items:center;width:20px;height:20px;border-radius:50%;border:1.5px solid var(--line);flex:none}
+.step.run{color:var(--fg);font-weight:600}.step.run .d{border-color:var(--acc)}
+.step.done{color:var(--fg)}.step.done .d{background:var(--green);border-color:var(--green);color:#fff}
+.step .det{margin-left:auto;font-size:12px;font-variant-numeric:tabular-nums}
+.note{padding:9px 12px;border-radius:9px;font-size:12.5px;background:var(--accsoft)}
+.note.err{background:rgba(255,69,58,.14);color:var(--red)}
+.center{display:flex;flex-direction:column;align-items:center;gap:8px;padding:14px 6px;text-align:center}
+.center .bigc{display:grid;place-items:center;width:60px;height:60px;border-radius:50%;background:var(--green);color:#fff;animation:pop .4s cubic-bezier(.2,.9,.3,1.4)}
+.center h3{margin:0;font-size:17px}.center p{margin:0;color:var(--fg2);max-width:44ch}
+.acts{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;margin-top:6px}
+.lnk{color:var(--acc);text-decoration:none}
+
+/* picker (move to…) */
+.pk{border:.5px solid var(--line);border-radius:9px;max-height:300px;overflow:auto;padding:4px}
+.pkr{display:flex;align-items:center;gap:6px;height:26px;padding:0 8px;border-radius:6px}
+.pkr:hover{background:var(--hover)}.pkr.on{background:var(--acc);color:#fff}.pkr.dis{opacity:.4}
+
+/* editor */
+.ed{display:flex;flex:1;min-height:0;border-top:.5px solid var(--line2);background:var(--input)}
+.ed-gut{flex:none;min-width:46px;padding:12px 8px 24px 10px;overflow:hidden;white-space:pre;text-align:right;font:12.5px/20px var(--mono);color:var(--fg3);background:var(--stripe);user-select:none}
+.ed-ta{flex:1;min-width:0;resize:none;border:0;outline:0;padding:12px 14px 24px;background:transparent;font:12.5px/20px var(--mono);white-space:pre;overflow:auto;tab-size:2}
+.ed-ta.wrap{white-space:pre-wrap;word-break:break-word}
+
+/* quick look */
+.ql{display:flex;flex-direction:column;width:min(860px,100%);height:min(620px,100%);border-radius:12px;background:var(--pop);box-shadow:0 24px 80px rgba(0,0,0,.55),0 0 0 .5px var(--line);overflow:hidden;animation:pop .22s cubic-bezier(.2,.9,.3,1.1)}
+.ql-h{display:flex;align-items:center;gap:8px;height:44px;padding:0 12px 0 16px;border-bottom:.5px solid var(--line2)}
+.ql-h .t{flex:1;min-width:0;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ql-b{flex:1;min-height:0;display:grid;place-items:center;overflow:auto;background:var(--stripe)}
+.ql-b img{max-width:94%;max-height:94%;object-fit:contain;border-radius:4px;box-shadow:0 2px 16px rgba(0,0,0,.25);background:repeating-conic-gradient(rgba(128,128,128,.15) 0 25%,transparent 0 50%) 0 0/16px 16px}
+.ql-b pre{margin:0;align-self:stretch;width:100%;padding:14px 18px;font:12.5px/1.55 var(--mono);white-space:pre;overflow:auto;background:var(--input)}
+
+.veil{position:fixed;inset:0;z-index:2147483004;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,.4);backdrop-filter:blur(5px)}
+.veil.show{display:flex}.veil *{pointer-events:none}
+.veil-card{display:flex;flex-direction:column;align-items:center;gap:8px;padding:40px 60px;border:2.5px dashed var(--acc);border-radius:22px;background:var(--pop);text-align:center;animation:pop .2s}
+.veil-card .t{font-size:19px;font-weight:600}
+.dragimg{position:fixed;top:-200px;left:-200px;padding:5px 12px;border-radius:14px;background:var(--acc);color:#fff;font-weight:600;font-size:12px}
+.resz{position:absolute;right:0;bottom:0;width:18px;height:18px;cursor:nwse-resize;z-index:50}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+`;
+
+  /* ───────────────────────── scaffold ───────────────────────── */
+  const ui = { ready: false, rowEls: new Map(), pickDir: '' };
+  const host = h('div', { id: 'gh-finder-host' });
+  const shadow = host.attachShadow({ mode: 'open' });
+  const root = h('div', { class: 'root', 'data-theme': 'light' });
+  const defs = h('div', { style: 'position:absolute;width:0;height:0;overflow:hidden' });
+  defs.innerHTML = '<svg width="0" height="0"><defs><linearGradient id="gfb" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#4fb0f8"/><stop offset="1" stop-color="#1f83e8"/></linearGradient><linearGradient id="gff" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#a2deff"/><stop offset="1" stop-color="#46aef7"/></linearGradient><linearGradient id="gpg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#e6e8ee"/></linearGradient></defs></svg>';
+
+  const fab = h('button', { class: 'fab', title: 'Open the repo file manager', onClick: () => openPanel() });
+  const scrim = h('div', { class: 'scrim' });
+  const win = h('div', { class: 'win', role: 'dialog', 'aria-label': 'GitHub Finder' });
+  const veilText = h('div', { class: 't' }, 'Drop to add to this repository');
+  const veil = h('div', { class: 'veil' }, h('div', { class: 'veil-card' }, icon('upload', 36), veilText, h('div', { class: 'muted' }, 'Files and whole folders both work')));
+  const menuLayer = h('div', { class: 'layer' });
+  const toasts = h('div', { class: 'toasts' });
+
+  ui.sb = h('div', { class: 'sb' });
+  ui.sbScroll = h('div', { class: 'sb-scroll' });
+  ui.sbFoot = h('div', { class: 'sb-foot' });
+  ui.tb = h('div', { class: 'tb' });
+  ui.content = h('div', { class: 'content', tabindex: '0' });
+  ui.path = h('div', { class: 'path' });
+  ui.insp = h('div', { class: 'insp' });
+  ui.search = h('input', { placeholder: 'Search repo', spellcheck: 'false', autocomplete: 'off' });
+  ui.fileInput = h('input', { type: 'file', multiple: true, hidden: true });
+  ui.dirInput = h('input', { type: 'file', webkitdirectory: true, directory: true, multiple: true, hidden: true });
+  const sheetLayer = h('div', { class: 'sheet-layer' });
+  const dlgLayer = h('div', { class: 'dlg-layer' });
+  const qlLayer = h('div', { class: 'ql-layer' });
+  const resz = h('div', { class: 'resz' });
+  const lights = h('div', { class: 'lights' },
+    h('button', { class: 'r', title: 'Close', onClick: () => closePanel() }, lightSvg('x')),
+    h('button', { class: 'y', title: 'Minimize', onClick: () => minimize() }, lightSvg('min')),
+    h('button', { class: 'g', title: 'Zoom', onClick: () => toggleMax() }, lightSvg('max')));
+  function lightSvg(k) {
+    const s = h('span', { style: 'display:contents' });
+    const d = { x: 'M3.2 3.2l5.6 5.6M8.8 3.2L3.2 8.8', min: 'M2.8 6h6.4', max: 'M3.4 8.6V3.4h5.2M8.6 3.4v5.2H3.4' }[k];
+    s.innerHTML = `<svg viewBox="0 0 12 12" width="12" height="12"><path d="${d}" stroke="#000" stroke-width="1.3" stroke-linecap="round" fill="none"/></svg>`;
+    return s;
+  }
+  ui.sb.append(h('div', { class: 'sb-top' }), ui.sbScroll, ui.sbFoot);
+  ui.seg = h('div', { class: 'seg', 'data-v': S.view });
+  win.append(lights, ui.sb, h('div', { class: 'rt' }, ui.tb, h('div', { class: 'mid' }, h('div', { class: 'main' }, ui.content, ui.path), ui.insp)), sheetLayer, qlLayer, dlgLayer, resz, ui.fileInput, ui.dirInput);
+  root.append(defs, fab, scrim, win, veil, menuLayer, toasts);
+  shadow.append(h('style', {}, CSS), root);
+  document.body.append(host);
+
+  /* theme */
+  const mq = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+  function applyTheme() {
+    const t = S.appearance === 'auto' ? (mq && mq.matches ? 'dark' : 'light') : S.appearance;
+    root.setAttribute('data-theme', t);
+  }
+  if (mq && mq.addEventListener) mq.addEventListener('change', applyTheme);
+  applyTheme();
+
+  /* ───────────────────────── toasts, menus, dialogs, sheets ───────────────────────── */
+  const toastEls = new Map();
+  function toast(text, o = {}) {
+    if (!text) return;
+    let el = o.id && toastEls.get(o.id);
+    if (el) { el.firstChild.textContent = text; el.className = `toast ${o.type || ''}`; clearTimeout(el._t); }
+    else {
+      el = h('div', { class: `toast ${o.type || ''}` }, h('span', { style: 'flex:1' }, text));
+      if (o.action) el.append(h('button', { class: 'ta', onClick: () => { o.action.fn(); kill(); } }, o.action.label));
+      toasts.append(el);
+      if (o.id) toastEls.set(o.id, el);
+    }
+    function kill() { clearTimeout(el._t); el.classList.add('out'); setTimeout(() => { el.remove(); if (o.id) toastEls.delete(o.id); }, 200); }
+    if (!o.sticky) el._t = setTimeout(kill, o.ms || (o.type === 'err' ? 6500 : 3600));
+    while (toasts.children.length > 4) toasts.firstChild.remove();
+  }
+
+  let menuEl = null;
+  function closeMenu() { if (menuEl) { menuEl = null; menuLayer.replaceChildren(); } }
+  function buildMenu(items) {
+    const m = h('div', { class: 'menu', onContextmenu: (e) => e.preventDefault() });
+    for (const it of items) {
+      if (!it) continue;
+      if (it.sep) { m.append(h('div', { class: 'm-sep' })); continue; }
+      if (it.head) { m.append(h('div', { class: 'm-hd' }, it.head)); continue; }
+      const row = h('div', { class: `m-it${it.disabled ? ' dis' : ''}${it.danger ? ' danger' : ''}`, onClick: (e) => { e.stopPropagation(); if (it.disabled || it.sub) return; closeMenu(); if (it.act) it.act(); } },
+        h('span', { class: 'm-ck' }, it.check ? '✓' : ''), h('span', { class: 'm-l' }, it.label), it.key ? h('span', { class: 'm-k' }, it.key) : null, it.sub ? icon('chev', 11, 2.4) : null);
+      if (it.sub) row.append(buildMenu(it.sub));
+      m.append(row);
+    }
+    return m;
+  }
+  function showMenu(x, y, items) {
+    closeMenu();
+    menuEl = buildMenu(items);
+    menuLayer.replaceChildren(menuEl);
+    const r = menuEl.getBoundingClientRect();
+    const nx = x + r.width > innerWidth - 8 ? Math.max(8, x - r.width) : x;
+    const ny = y + r.height > innerHeight - 8 ? Math.max(8, innerHeight - r.height - 8) : y;
+    menuEl.style.left = `${nx}px`; menuEl.style.top = `${ny}px`;
+    if (nx + r.width * 2 + 20 > innerWidth) menuLayer.classList.add('flip'); else menuLayer.classList.remove('flip');
+  }
+  const menuBelow = (el, items, alignRight) => { const r = el.getBoundingClientRect(); showMenu(alignRight ? r.right - 232 : r.left, r.bottom + 5, items); };
+  window.addEventListener('mousedown', (e) => { if (menuEl && !e.composedPath().includes(menuEl)) closeMenu(); }, true);
+  window.addEventListener('blur', closeMenu);
+
+  function dialog({ title, msg, buttons, input, check }) {
+    return new Promise((res) => {
+      const inp = input ? h('input', { class: 'dlg-in', value: input.value || '', placeholder: input.placeholder || '', spellcheck: 'false' }) : null;
+      const cb = check ? h('input', { type: 'checkbox' }) : null;
+      const close = (v) => { dlgLayer.classList.remove('show'); dlgLayer.replaceChildren(); res({ value: v, text: inp ? inp.value : undefined, checked: cb ? cb.checked : false }); };
+      const prim = buttons.find((b) => b.primary || b.danger) || buttons[buttons.length - 1];
+      const box = h('div', { class: 'dlg', onKeydown: (e) => { e.stopPropagation(); if (e.key === 'Escape') { e.preventDefault(); close(null); } else if (e.key === 'Enter') { e.preventDefault(); close(prim.value); } } },
+        h('h4', {}, title), msg ? h('p', {}, msg) : null, inp, check ? h('label', {}, cb, check) : null,
+        h('div', { class: 'dbtns' }, buttons.map((b) => h('button', { class: `dbtn${b.primary ? ' primary' : ''}${b.danger ? ' danger' : ''}`, onClick: () => close(b.value) }, b.label))));
+      dlgLayer.replaceChildren(box); dlgLayer.classList.add('show');
+      setTimeout(() => (inp || box.querySelector('.primary,.danger') || box.querySelector('button')).focus(), 20);
+      if (inp) setTimeout(() => inp.select(), 25);
+    });
+  }
+  const dlgOpen = () => dlgLayer.classList.contains('show');
+
+  let sheetCur = null;
+  function openSheet(node, o = {}) { sheetCur = o; sheetLayer.replaceChildren(h('div', { class: `sheet${o.wide ? ' wide' : ''}`, onMousedown: (e) => e.stopPropagation() }, node)); sheetLayer.classList.add('show'); }
+  function closeSheet() { sheetLayer.classList.remove('show'); sheetLayer.replaceChildren(); sheetCur = null; }
+  sheetLayer.addEventListener('mousedown', (e) => { if (e.target === sheetLayer && sheetCur && !sheetCur.lock) closeSheet(); });
+  const sheetOpen = () => sheetLayer.classList.contains('show');
+
+  /* ───────────────────────── view model ───────────────────────── */
+  let vis = [];
+  const itemMap = new Map();
+  let inspTok = 0;
+  let dirLoading = false;
+  const STATUS = { new: 'New', mod: 'Edited', move: 'Moved', copy: 'Copy' };
+  const sizeOf = (it) => (it.e ? it.e.size || 0 : 0);
+
+  function sortItems(arr) {
+    const { key, dir } = S.sort;
+    return arr.sort((x, y) => {
+      if (x.dir !== y.dir) return x.dir ? -1 : 1;
+      let c = 0;
+      if (key === 'size') c = sizeOf(x) - sizeOf(y);
+      else if (key === 'kind') c = collator.compare(kindOf(x.name, x.dir, x.e && x.e.type), kindOf(y.name, y.dir, y.e && y.e.type));
+      if (!c) c = collator.compare(x.name, y.name);
+      return c * dir;
+    });
+  }
+  function visibleItems() {
+    const hid = (n) => !S.showHidden && n.startsWith('.');
+    if (S.q) {
+      const q = S.q.toLowerCase(); const out = [];
+      for (const [p, e] of W) { if (p.toLowerCase().includes(q) && !hid(basename(p))) out.push({ name: basename(p), path: p, dir: false, e, where: dirname(p), rank: basename(p).toLowerCase().includes(q) ? 0 : 1 }); if (out.length > 3000) break; }
+      for (const d of idx().keys()) if (d && basename(d).toLowerCase().includes(q)) out.push({ name: basename(d), path: d, dir: true, where: dirname(d), rank: 0 });
+      out.sort((a, b) => a.rank - b.rank || collator.compare(a.name, b.name));
+      return out.slice(0, 500);
+    }
+    const out = [];
+    const walk = (dir, depth) => {
+      for (const it of sortItems(listDir(dir).filter((x) => !hid(x.name)))) {
+        out.push({ ...it, depth });
+        if (it.dir && S.view === 'list' && S.exp.has(it.path) && isLoaded(it.path)) walk(it.path, depth + 1);
+      }
+    };
+    walk(S.cwd, 0);
+    return out;
+  }
+  function folderStats(p) {
+    let n = 0; let size = 0; const pre = p ? `${p}/` : '';
+    for (const [k, e] of W) if (!p || k.startsWith(pre)) { n++; size += e.size || 0; }
+    return { n, size };
+  }
+  const selItems = () => [...S.sel].map((p) => itemMap.get(p) || lookupItem(p)).filter(Boolean);
+  function lookupItem(p) { const m = idx().get(dirname(p)); return m ? m.get(basename(p)) : null; }
+
+  /* ───────────────────────── render: sidebar ───────────────────────── */
+  function sbRow(label, path, depth, expandable, root) {
+    const open = S.sbExp.has(path);
+    const hasKids = root || listDir(path).some((x) => x.dir);
+    return h('div', { class: `sbr${S.cwd === path ? ' on' : ''}`, 'data-p': path, 'data-sb': '1', 'data-d': '1', style: `padding-left:${4 + depth * 14}px` },
+      expandable && hasKids ? h('span', { class: `tri${open ? ' open' : ''}`, 'data-tri': '1' }, icon('chev', 10, 3)) : h('span', { class: 'tri-sp' }),
+      root ? icon('repo', 16) : (() => { const s = h('span', { class: 'fico' }); s.innerHTML = folderSvg(18); return s; })(),
+      h('span', { class: 'nm' }, label),
+      h('button', { class: 'add', 'data-add': path, title: 'Add to this folder' }, icon('plus', 12, 2.4)));
+  }
+  function renderSide() {
+    const rows = [];
+    if (S.repo) {
+      rows.push(h('div', { class: 'sb-h' }, S.repo.owner));
+      rows.push(sbRow(S.repo.name, '', 0, true, true));
+      const walk = (dir, depth) => {
+        for (const it of sortItems(listDir(dir).filter((x) => x.dir && (S.showHidden || !x.name.startsWith('.'))))) {
+          rows.push(sbRow(it.name, it.path, depth, true, false));
+          if (S.sbExp.has(it.path) && isLoaded(it.path)) walk(it.path, depth + 1);
+        }
+      };
+      if (S.sbExp.has('')) walk('', 1);
+      const n = chg().total;
+      rows.push(h('div', { class: 'sb-h' }, 'Changes'));
+      rows.push(h('div', { class: 'sbr', 'data-changes': '1' }, h('span', { class: 'tri-sp' }), icon('upload', 15), h('span', { class: 'nm' }, n ? 'Review & commit' : 'No pending changes'), n ? h('span', { class: 'cnt' }, n) : null));
+    }
+    ui.sbScroll.replaceChildren(...rows);
+    ui.sbFoot.replaceChildren(
+      h('div', { class: 'sbr', 'data-branch': '1' }, h('span', { class: 'tri-sp' }), icon('branch', 15), h('span', { class: 'nm' }, S.branch || 'No branch'), icon('down', 12)),
+      h('div', { class: 'sbr', 'data-account': '1' }, h('span', { class: 'tri-sp' }), icon('key', 15), h('span', { class: 'nm' }, 'Account')));
+  }
+
+  /* ───────────────────────── render: toolbar ───────────────────────── */
+  const tbtn = (ic, title, fn, o = {}) => h('button', { class: `tbtn${o.on ? ' on' : ''}${o.cls ? ` ${o.cls}` : ''}`, title, disabled: !!o.disabled, onClick: (e) => { closeMenu(); fn(e); } }, icon(ic, o.size || 17));
+  function renderTools() {
+    const has = S.sel.size > 0;
+    const c = chg();
+    ui.seg.dataset.v = S.view;
+    const title = S.cwd ? basename(S.cwd) : S.repo ? S.repo.name : 'GitHub Finder';
+    const sortBtn = tbtn('sort', 'Sort & view options', (e) => menuBelow(e.currentTarget, sortMenu(), true), { cls: 'hide-n' });
+    ui.tb.replaceChildren(
+      tbtn('sidebar', 'Toggle sidebar', toggleSidebar, { on: S.sidebar }),
+      tbtn('back', 'Back  ⌘[', goBack, { disabled: S.hi <= 0 }),
+      tbtn('fwd', 'Forward  ⌘]', goFwd, { disabled: S.hi >= S.hist.length - 1 }),
+      h('div', { class: 'tb-title' }, itemIcon({ dir: true, name: '' }, 22), h('span', { class: 't', title: S.cwd || '/' }, title)),
+      S.repo ? h('button', { class: 'chip hide-n', title: 'Switch branch', onClick: (e) => branchMenu(e.currentTarget) }, icon('branch', 12), S.branch, icon('down', 10)) : null,
+      h('div', { class: 'sp' }),
+      undoSt.length ? tbtn('undo', `Undo “${undoSt[undoSt.length - 1].label}”  ⌘Z`, undo, { cls: 'hide-n' }) : null,
+      redoSt.length ? tbtn('redo', 'Redo  ⇧⌘Z', redo, { cls: 'hide-n' }) : null,
+      c.total ? h('div', { class: 'pill' }, `${plural(c.total, 'change')}`, h('button', { class: 'go', onClick: showCommitSheet }, 'Commit…')) : null,
+      ui.seg,
+      sortBtn,
+      tbtn('download', 'Download selection', () => downloadItems([...S.sel]), { disabled: !has }),
+      tbtn('link', 'Copy GitHub link', (e) => menuBelow(e.currentTarget, linkMenu([...S.sel]), true), { disabled: !S.repo }),
+      tbtn('trash', 'Delete  ⌫', () => deleteItems([...S.sel]), { disabled: !has }),
+      h('button', { class: 'plus', title: 'Add file or folder', disabled: !S.repo, onClick: (e) => { e.stopPropagation(); menuBelow(e.currentTarget, addMenu(S.cwd), true); } }, icon('plus', 16, 2.6)),
+      h('div', { class: 'search' }, icon('search', 14), ui.search),
+      tbtn('panel', 'Toggle inspector  ⌘I', toggleInspector, { on: S.inspector, cls: 'hide-n' }),
+      tbtn('gear', 'Options', (e) => menuBelow(e.currentTarget, optionsMenu(), true), { cls: 'hide-n' }));
+  }
+
+  /* ───────────────────────── menus ───────────────────────── */
+  const addMenu = (dir) => [
+    { head: `Add to “${dir ? basename(dir) : S.repo.name}”` },
+    { label: 'New Folder', key: '⇧⌘N', act: () => newFolder(dir) },
+    { label: 'New File…', key: '⌘N', act: () => newFile(dir) },
+    { sep: true },
+    { label: 'Upload Files…', act: () => pickFiles(dir, false) },
+    { label: 'Upload Folder…', act: () => pickFiles(dir, true) },
+    { sep: true },
+    { label: 'Paste', key: '⌘V', disabled: !S.clip, act: () => paste(dir) },
+  ];
+  const linkMenu = (paths) => {
+    const hasDir = paths.some((p) => isDir(p));
+    return [
+      { label: 'GitHub link', act: () => copyLink('gh', paths) },
+      { label: hasDir ? 'Raw link (files only)' : 'Raw link', act: () => copyLink('raw', paths) },
+      { label: 'Permalink (this commit)', act: () => copyLink('perma', paths) },
+      { sep: true },
+      { label: 'Path', act: () => copyLink('path', paths) },
+    ];
+  };
+  const sortMenu = () => [
+    { head: 'Sort by' },
+    ...[['name', 'Name'], ['size', 'Size'], ['kind', 'Kind']].map(([k, l]) => ({ label: l, check: S.sort.key === k, act: () => { S.sort.key = k; ui.all(); } })),
+    { sep: true },
+    { label: 'Ascending', check: S.sort.dir === 1, act: () => { S.sort.dir = 1; ui.all(); } },
+    { label: 'Descending', check: S.sort.dir === -1, act: () => { S.sort.dir = -1; ui.all(); } },
+    { sep: true },
+    { label: 'as Icons', key: '⌘1', check: S.view === 'icons', act: () => setView('icons') },
+    { label: 'as List', key: '⌘2', check: S.view === 'list', act: () => setView('list') },
+    { sep: true },
+    { label: 'Show Hidden Files', check: S.showHidden, act: () => { S.showHidden = !S.showHidden; GM_setValue('ghf_hidden', S.showHidden); ui.all(); } },
+  ];
+  const optionsMenu = () => [
+    { label: 'Appearance', sub: [['auto', 'Match System'], ['light', 'Light'], ['dark', 'Dark']].map(([k, l]) => ({ label: l, check: S.appearance === k, act: () => { S.appearance = k; GM_setValue('ghf_theme', k); applyTheme(); } })) },
+    { label: 'Show Inspector', key: '⌘I', check: S.inspector, act: toggleInspector },
+    { label: 'Show Hidden Files', check: S.showHidden, act: () => { S.showHidden = !S.showHidden; GM_setValue('ghf_hidden', S.showHidden); ui.all(); } },
+    { label: 'Skip junk files on upload', check: S.skipJunk, act: () => { S.skipJunk = !S.skipJunk; GM_setValue('ghf_junk', S.skipJunk); } },
+    { sep: true },
+    { label: 'Reload from GitHub', act: reloadRepo },
+    { label: 'New Branch…', act: createBranch },
+    { sep: true },
+    { label: 'Account & Token…', act: showTokenSheet },
+    { label: 'Keyboard Shortcuts', act: showShortcuts },
+  ];
+  async function branchMenu(el) {
+    if (!S.branches.length && S.repo) { try { S.branches = (await api('GET', `/repos/${S.repo.owner}/${S.repo.name}/branches?per_page=100`)).map((b) => b.name); } catch (_) { /* ignore */ } }
+    const items = S.branches.slice(0, 100).map((b) => ({ label: b, check: b === S.branch, act: () => switchBranch(b) }));
+    menuBelow(el, [{ head: 'Switch branch' }, ...items, { sep: true }, { label: 'New Branch…', act: createBranch }], false);
+  }
+  async function reloadRepo() {
+    if (chg().total) { const r = await dialog({ title: 'Reload from GitHub?', msg: `This discards ${plural(chg().total, 'pending change')}.`, buttons: [{ label: 'Cancel', value: null }, { label: 'Discard & Reload', value: 'go', danger: true }] }); if (!r.value) return; }
+    await loadTree(S.cwd);
+  }
+  function showShortcuts() {
+    dialog({ title: 'Keyboard shortcuts', msg: 'Space  Quick Look      ↵  Rename\n⌘↓  Open      ⌘↑  Enclosing folder\n⌘C / ⌘X / ⌘V  Copy / Cut / Paste\n⌘D  Duplicate      ⌫  Delete\n⇧⌘N  New folder      ⌘N  New file\n⌘Z / ⇧⌘Z  Undo / Redo      ⌘F  Search\n⌘[ / ⌘]  Back / Forward      ⌘A  Select all\n⌘1 / ⌘2  Icons / List      ⌘I  Inspector\n⌘↵  Review & commit      Esc  Close', buttons: [{ label: 'Done', value: 'ok', primary: true }] });
+  }
+
+  function itemMenu(it) {
+    const paths = [...S.sel];
+    const one = paths.length === 1;
+    const d = one && isDir(paths[0]);
+    const file = one && !d;
+    const first = one ? (lookupItem(paths[0]) || it) : null;
+    const textish = file && first && first.e && first.e.type !== 'commit';
+    return [
+      one ? { label: 'Open', key: '⌘↓', act: () => openItem(first || it) } : null,
+      file ? { label: 'Quick Look', key: 'Space', act: () => openQuickLook(paths[0]) } : null,
+      textish ? { label: 'Edit…', act: () => openEditor(paths[0]) } : null,
+      S.q && one ? { label: 'Show in Folder', act: () => reveal(paths[0]) } : null,
+      { sep: true },
+      one ? { label: 'Rename', key: '↵', act: () => beginRename(paths[0]) } : null,
+      { label: 'Move to…', act: () => movePicker(paths) },
+      { label: 'Duplicate', key: '⌘D', act: () => transfer(paths, dirname(paths[0]), true) },
+      { label: 'Cut', key: '⌘X', act: () => copySel(true) },
+      { label: 'Copy', key: '⌘C', act: () => copySel(false) },
+      d ? { label: 'Paste into folder', key: '⌘V', disabled: !S.clip, act: () => paste(paths[0]) } : null,
+      { sep: true },
+      { label: d || !one ? 'Download as ZIP' : 'Download', act: () => downloadItems(paths) },
+      { label: 'Copy Link', sub: linkMenu(paths) },
+      one ? { label: 'Open on GitHub', act: () => openOnGitHub(paths[0]) } : null,
+      d ? { sep: true } : null,
+      d ? { label: 'Add to this folder', sub: addMenu(paths[0]).slice(1, 5) } : null,
+      { sep: true },
+      { label: 'Get Info', key: '⌘I', act: () => { S.inspector = true; GM_setValue('ghf_insp', true); applyLayout(); renderInsp(); } },
+      { sep: true },
+      { label: paths.length > 1 ? `Delete ${paths.length} Items` : 'Delete', key: '⌫', danger: true, act: () => deleteItems(paths) },
+    ];
+  }
+  const bgMenu = () => [
+    { label: 'New Folder', key: '⇧⌘N', act: () => newFolder(S.cwd) },
+    { label: 'New File…', key: '⌘N', act: () => newFile(S.cwd) },
+    { sep: true },
+    { label: 'Upload Files…', act: () => pickFiles(S.cwd, false) },
+    { label: 'Upload Folder…', act: () => pickFiles(S.cwd, true) },
+    { sep: true },
+    { label: 'Paste', key: '⌘V', disabled: !S.clip, act: () => paste(S.cwd) },
+    { label: 'Select All', key: '⌘A', act: selectAll },
+    { sep: true },
+    { label: 'Sort & View', sub: sortMenu().filter((x) => !x.head) },
+    { label: 'Copy Link to This Folder', act: () => copyLink('gh', [S.cwd]) },
+    { label: 'Open on GitHub', act: () => openOnGitHub(S.cwd) },
+  ];
+  function copySel(cut) {
+    const paths = topLevel([...S.sel]);
+    if (!paths.length) return;
+    S.clip = { paths, cut, set: new Set(paths) };
+    toast(`${cut ? 'Cut' : 'Copied'} ${plural(paths.length, 'item')}. Paste it into any folder.`);
+    renderContent();
+  }
+  function paste(dir) {
+    if (!S.clip) return;
+    const { paths, cut } = S.clip;
+    if (cut) S.clip = null;
+    transfer(paths.filter((p) => exists(p)), dir, !cut);
+  }
+  function selectAll() { S.sel = new Set(vis.map((x) => x.path)); S.anchor = vis[0] && vis[0].path; paintSel(); }
+
+  /* ───────────────────────── render: content ───────────────────────── */
+  const emptyState = (...kids) => h('div', { class: 'empty' }, ...kids);
+  function renameInput(it) {
+    let done = false;
+    const finish = async (ok) => {
+      if (done) return; done = true;
+      const path = it.path;
+      if (S.renaming !== path) return;
+      S.renaming = null;
+      if (!ok) { renderContent(); return; }
+      const good = await renameItem(path, inp.value);
+      if (!good) { S.renaming = path; renderContent(); startRename(); } else renderContent();
+    };
+    const inp = h('input', { class: 'rn', value: it.name, spellcheck: 'false', onMousedown: (e) => e.stopPropagation(), onClick: (e) => e.stopPropagation(), onDblclick: (e) => e.stopPropagation(), onKeydown: (e) => { e.stopPropagation(); if (e.key === 'Enter') { e.preventDefault(); finish(true); } else if (e.key === 'Escape') { e.preventDefault(); finish(false); } }, onBlur: () => finish(true) });
+    return inp;
+  }
+  function startRename() {
+    requestAnimationFrame(() => {
+      const el = S.renaming && ui.rowEls.get(S.renaming);
+      const i = el && el.querySelector('.rn');
+      if (!i) return;
+      i.focus();
+      const dot = i.value.lastIndexOf('.');
+      i.setSelectionRange(0, dot > 0 && !isDir(S.renaming) ? dot : i.value.length);
+    });
+  }
+  function beginRename(path) {
+    if (!path) return;
+    S.sel = new Set([path]); S.anchor = path; S.renaming = path;
+    renderContent(); startRename();
+  }
+  function badge(it) {
+    const c = chg(); const s = c.st.get(it.path);
+    if (s) return h('span', { class: `tag t-${s}` }, STATUS[s]);
+    if (it.dir && c.dirty.has(it.path)) return h('span', { class: 'dot', title: 'Contains changes' });
+    return null;
+  }
+  const cutCls = (p) => (S.clip && S.clip.cut && S.clip.set.has(p) ? ' cut' : '');
+  function listRow(it) {
+    const p = it.path;
+    const open = S.exp.has(p);
+    const el = h('div', { class: `lr${cutCls(p)}`, 'data-p': p, 'data-d': it.dir ? '1' : '0', draggable: !S.renaming },
+      h('div', { class: 'c-name', style: `padding-left:${10 + (it.depth || 0) * 18}px` },
+        it.dir && !S.q ? h('span', { class: `tri${open ? ' open' : ''}`, 'data-tri': '1' }, icon('chev', 10, 3)) : h('span', { class: 'tri-sp' }),
+        itemIcon(it, 18),
+        S.renaming === p ? renameInput(it) : h('span', { class: 'nm', title: p }, it.name),
+        badge(it),
+        S.q ? h('span', { class: 'where' }, it.where || '/') : null),
+      h('div', { class: 'c-kind' }, kindOf(it.name, it.dir, it.e && it.e.type)),
+      h('div', { class: 'c-size' }, it.dir ? '--' : fmt(it.e.size || 0)));
+    return el;
+  }
+  function iconCell(it) {
+    const p = it.path;
+    return h('div', { class: `ic${cutCls(p)}`, 'data-p': p, 'data-d': it.dir ? '1' : '0', draggable: !S.renaming, title: p },
+      h('div', { class: 'ic-img' }, itemIcon(it, 56), badge(it)),
+      h('div', { class: 'ic-name' }, S.renaming === p ? renameInput(it) : h('span', {}, it.name)));
+  }
+  function sortHeader() {
+    const col = (k, label) => h('div', { class: S.sort.key === k ? 'on' : '', 'data-sort': k }, label, S.sort.key === k ? icon(S.sort.dir === 1 ? 'up' : 'down', 11, 2.6) : null);
+    return h('div', { class: 'lh' }, col('name', 'Name'), col('kind', 'Kind'), col('size', 'Size'));
+  }
+  function renderContent() {
+    const c = ui.content; const sc = c.scrollTop;
+    ui.rowEls = new Map(); itemMap.clear();
+    c.classList.remove('dt-bg');
+    if (!S.repo && !S.loading && !S.loadError) { vis = []; c.replaceChildren(emptyState(h('div', { class: 'big' }, itemIcon({ dir: true, name: '' }, 72)), h('h3', {}, 'No repository open'), h('p', {}, 'Open a repository on GitHub, then launch the file manager from the button at the bottom left.'))); return; }
+    if (S.loading) { vis = []; c.replaceChildren(emptyState(h('div', { class: 'spin' }), h('p', {}, 'Reading the whole repository…'))); return; }
+    if (S.loadError) { vis = []; c.replaceChildren(emptyState(h('div', { class: 'big', style: 'color:var(--red)' }, icon('alert', 40)), h('h3', {}, 'Couldn’t open this repository'), h('p', {}, S.loadError), h('div', { class: 'acts' }, h('button', { class: 'xbtn pri', onClick: () => loadLocation() }, 'Try Again'), h('button', { class: 'xbtn', onClick: showTokenSheet }, 'Account & Token…')))); return; }
+    if (!S.q && !isLoaded(S.cwd)) {
+      vis = [];
+      c.replaceChildren(emptyState(h('div', { class: 'spin' })));
+      if (!dirLoading) { dirLoading = true; ensureShallow(S.cwd).catch((e) => toast(friendly(e), { type: 'err' })).finally(() => { dirLoading = false; ui.all(); }); }
+      return;
+    }
+    vis = visibleItems();
+    if (!vis.length) {
+      c.replaceChildren(S.q ? emptyState(h('div', { class: 'big' }, icon('search', 40)), h('h3', {}, `No results for “${S.q}”`), h('p', {}, 'Searches file and folder names across the whole repository.'))
+        : emptyState(h('div', { class: 'big' }, itemIcon({ dir: true, name: '' }, 84)), h('h3', {}, 'This folder is empty'), h('p', {}, 'Drop files here, or use the + button to add a file or folder.'), h('div', { class: 'acts' }, h('button', { class: 'xbtn pri', onClick: (e) => menuBelow(e.currentTarget, addMenu(S.cwd), false) }, 'Add…'))));
+      paintSel();
+      return;
+    }
+    const shown = vis.slice(0, MAX_RENDER);
+    const asList = S.view === 'list' || S.q;
+    const nodes = shown.map((it) => { const el = asList ? listRow(it) : iconCell(it); ui.rowEls.set(it.path, el); itemMap.set(it.path, it); return el; });
+    if (asList) c.replaceChildren(sortHeader(), h('div', { class: 'lrows' }, nodes, vis.length > MAX_RENDER ? h('div', { class: 'empty', style: 'min-height:60px' }, `+ ${vis.length - MAX_RENDER} more items. Use search to find them.`) : null));
+    else c.replaceChildren(h('div', { class: 'icons' }, nodes));
+    c.scrollTop = sc;
+    paintSel();
+  }
+  function paintSel() {
+    for (const [p, el] of ui.rowEls) el.classList.toggle('sel', S.sel.has(p));
+    renderTools(); renderInsp(); renderPath();
+  }
+
+  /* ───────────────────────── render: path bar & inspector ───────────────────────── */
+  function renderPath() {
+    if (!S.repo) { ui.path.replaceChildren(); return; }
+    const segs = S.cwd ? S.cwd.split('/') : [];
+    const crumbs = [h('span', { class: `crumb${segs.length ? '' : ' last'}`, 'data-p': '', 'data-d': '1', 'data-crumb': '1' }, icon('repo', 13), S.repo.name)];
+    segs.forEach((s, i) => { const p = segs.slice(0, i + 1).join('/'); crumbs.push(h('span', { class: 'sep' }, icon('chev', 10, 2.6)), h('span', { class: `crumb${i === segs.length - 1 ? ' last' : ''}`, 'data-p': p, 'data-d': '1', 'data-crumb': '1' }, s)); });
+    let txt;
+    const n = vis.length;
+    if (S.q) txt = `${plural(n, 'result')}`;
+    else if (S.sel.size) { const its = selItems(); const sz = its.reduce((a, x) => a + (x.dir ? 0 : sizeOf(x)), 0); txt = `${S.sel.size} of ${plural(n, 'item')} selected${sz ? `, ${fmt(sz)}` : ''}`; }
+    else txt = plural(n, 'item');
+    ui.path.replaceChildren(h('div', { class: 'crumbs' }, crumbs), h('div', { class: 'stat' }, txt));
+  }
+
+  function renderInsp() {
+    if (!S.inspector || !S.repo || S.loading) { ui.insp.replaceChildren(); return; }
+    const tk = ++inspTok;
+    const paths = [...S.sel];
+    const row = (a, b) => h('div', { class: 'ip-row' }, h('span', {}, a), h('span', {}, b));
+    let box;
+    if (paths.length > 1) {
+      const its = selItems(); const sz = its.reduce((a, x) => a + (x.dir ? folderStats(x.path).size : sizeOf(x)), 0);
+      box = h('div', { class: 'ip' }, h('div', { class: 'ip-prev', style: 'min-height:110px' }, itemIcon({ dir: false, name: 'x.txt' }, 64)), h('div', { class: 'ip-name' }, `${paths.length} items`), h('div', { class: 'ip-sub' }, fmt(sz)),
+        h('div', { class: 'ip-act' }, h('button', { class: 'xbtn', onClick: () => downloadItems(paths) }, icon('download', 13), 'ZIP'), h('button', { class: 'xbtn', onClick: () => movePicker(paths) }, 'Move to…'), h('button', { class: 'xbtn dng', onClick: () => deleteItems(paths) }, icon('trash', 13), 'Delete')));
+    } else {
+      const p = paths.length ? paths[0] : S.cwd;
+      const it = paths.length ? (itemMap.get(p) || lookupItem(p)) : { name: S.cwd ? basename(S.cwd) : S.repo.name, path: S.cwd, dir: true };
+      if (!it) { ui.insp.replaceChildren(); return; }
+      const dir = it.dir; const e = it.e; const c = chg();
+      const st = c.st.get(p);
+      const prev = h('div', { class: 'ip-prev' }, itemIcon(it, dir ? 104 : 80));
+      const rows = [];
+      if (dir) { const s = folderStats(p); rows.push(row('Kind', 'Folder'), row('Contains', `${plural(s.n, 'file')}, ${fmt(s.size)}`)); }
+      else rows.push(row('Kind', kindOf(it.name, false, e.type)), row('Size', `${fmt(e.size || 0)}`), row('SHA', e.sha ? e.sha.slice(0, 10) : 'Not committed'), e.mode === '100755' ? row('Permissions', 'Executable') : null);
+      rows.push(row('Where', p ? `/${dirname(p)}`.replace(/\/$/, '') || '/' : '/'), row('Branch', S.branch), st ? row('Status', STATUS[st]) : (dir && c.dirty.has(p) ? row('Status', 'Contains changes') : null));
+      const acts = [];
+      if (!dir && e.type !== 'commit') acts.push(h('button', { class: 'xbtn pri', onClick: () => openEditor(p) }, icon('edit', 13), 'Edit'));
+      acts.push(h('button', { class: 'xbtn', onClick: () => downloadItems([p]) }, icon('download', 13), dir ? 'ZIP' : 'Download'), h('button', { class: 'xbtn', onClick: (e2) => menuBelow(e2.currentTarget, linkMenu([p]), false) }, icon('link', 13), 'Copy link'), h('button', { class: 'xbtn', onClick: () => openOnGitHub(p) }, icon('ext', 13), 'GitHub'));
+      if (paths.length) acts.push(h('button', { class: 'xbtn', onClick: () => movePicker([p]) }, 'Move to…'), h('button', { class: 'xbtn dng', onClick: () => deleteItems([p]) }, icon('trash', 13), 'Delete'));
+      box = h('div', { class: 'ip' }, prev, h('div', { class: 'ip-name' }, it.name), h('div', { class: 'ip-sub' }, dir ? (paths.length ? 'Folder' : 'Current folder') : `${kindOf(it.name, false, e.type)} · ${fmt(e.size || 0)}`), h('div', { class: 'ip-rows' }, rows), h('div', { class: 'ip-act' }, acts));
+      if (!dir) {
+        loadPreview(p, e).then((r) => {
+          if (tk !== inspTok) return;
+          if (r.kind === 'image') prev.replaceChildren(h('img', { src: r.url, alt: '' }));
+          else if (r.kind === 'text') prev.replaceChildren(h('pre', {}, r.text.split('\n').slice(0, 16).map((l) => l.slice(0, 80)).join('\n')));
+        });
+      }
+    }
+    ui.insp.replaceChildren(box);
+  }
+
+  /* ───────────────────────── sheets: token, commit, move-to, editor, quick look ───────────────────────── */
+  function showTokenSheet() {
+    const hasToken = !!token();
+    const state = { msg: '', busy: false };
+    const msgEl = h('div', {});
+    const inp = h('input', { class: 'inp', type: 'password', placeholder: 'github_pat_… or ghp_…', spellcheck: 'false', onKeydown: (e) => { if (e.key === 'Enter') save(); } });
+    const saveBtn = h('button', { class: 'xbtn pri', onClick: () => save() }, 'Save & Verify');
+    const setMsg = (t, cls) => { msgEl.replaceChildren(t ? h('div', { class: `note ${cls || ''}` }, t) : ''); };
+    const save = async () => {
+      const t = inp.value.trim();
+      if (!t || state.busy) return;
+      state.busy = true; saveBtn.disabled = true; setMsg('Checking token…');
+      const r = await gm('GET', `${API}/user`, null, t).catch((e) => ({ status: 0, data: { message: e.message } }));
+      state.busy = false; saveBtn.disabled = false;
+      if (r.status === 200) {
+        GM_setValue(TOKEN_KEY, t); closeSheet(); toast(`Connected as ${r.data.login}.`);
+        if (!S.repo || S.loadError) loadLocation(); else ui.all();
+      } else setMsg(r.status === 401 ? 'GitHub says this token is not valid.' : (r.data && r.data.message) || 'Could not verify the token.', 'err');
+    };
+    const body = h('div', { class: 'sh-b' },
+      h('div', { class: 'muted' }, 'Everything goes through the GitHub API, so this needs a personal access token. It is stored only in your userscript manager on this browser and is only ever sent to api.github.com.'),
+      h('div', {}, h('b', {}, 'Fine-grained token: '), 'choose the repositories, then set Contents to Read and write.'),
+      h('div', {}, h('b', {}, 'Classic token: '), 'tick the repo scope.'),
+      h('div', { class: 'chips' }, h('a', { class: 'xbtn', href: 'https://github.com/settings/personal-access-tokens/new', target: '_blank', rel: 'noopener' }, 'Create fine-grained token'), h('a', { class: 'xbtn', href: 'https://github.com/settings/tokens/new?scopes=repo&description=GitHub%20Finder', target: '_blank', rel: 'noopener' }, 'Create classic token')),
+      h('div', { class: 'fld' }, h('div', { class: 'l' }, 'Personal access token'), inp), msgEl);
+    const foot = h('div', { class: 'sh-f' }, h('div', { class: 'sum' }, hasToken ? 'A token is already saved.' : ''),
+      hasToken ? h('button', { class: 'xbtn dng', onClick: () => { GM_deleteValue(TOKEN_KEY); setMsg('Token removed.'); } }, 'Remove') : null,
+      h('button', { class: 'xbtn', onClick: closeSheet }, 'Close'), saveBtn);
+    if (!S.open) { S.open = true; S.min = false; showWin(); }
+    openSheet(h('div', { style: 'display:contents' }, h('div', { class: 'sh-h' }, h('div', { class: 'big' }, icon('key', 20)), h('div', {}, h('div', { class: 'sh-t' }, 'Connect GitHub'), h('div', { class: 'sh-s' }, 'One-time setup'))), body, foot));
+    setTimeout(() => inp.focus(), 60);
+  }
+
+  function showCommitSheet() {
+    const c = chg();
+    if (!c.total) return toast('No pending changes.');
+    let mode = 'direct';
+    const msgInp = h('input', { class: 'inp', placeholder: defaultMessage(), spellcheck: 'false' });
+    const nbInp = h('input', { class: 'inp', placeholder: 'add-files', spellcheck: 'false', onInput: () => { mode = 'new'; syncOpts(); } });
+    const optD = h('label', { class: 'opt on' }, h('input', { type: 'radio', name: 'cm', checked: true, onChange: () => { mode = 'direct'; syncOpts(); } }), h('div', {}, h('div', { class: 'ct' }, `Commit to ${S.branch}`), h('div', { class: 'cs' }, 'Changes appear in the repo right away.')));
+    const optN = h('label', { class: 'opt' }, h('input', { type: 'radio', name: 'cm', onChange: () => { mode = 'new'; syncOpts(); nbInp.focus(); } }), h('div', { style: 'flex:1;min-width:0' }, h('div', { class: 'ct' }, 'Create a new branch'), h('div', { class: 'cs' }, 'Leaves this branch untouched so you can open a pull request.'), nbInp));
+    function syncOpts() { optD.classList.toggle('on', mode === 'direct'); optN.classList.toggle('on', mode === 'new'); optD.querySelector('input').checked = mode === 'direct'; optN.querySelector('input').checked = mode === 'new'; }
+    const rows = [];
+    const addRows = (list, sym, cls, fn) => { for (const p of list) { if (rows.length >= 300) return; rows.push(h('div', { class: 'cr' }, h('span', { class: `tag t-${cls}`, style: 'margin:0;min-width:46px;text-align:center' }, sym), fn(p))); } };
+    addRows(c.adds, 'New', 'new', (p) => h('span', { class: 'p', title: p }, p));
+    addRows(c.mods, 'Edited', 'mod', (p) => h('span', { class: 'p', title: p }, p));
+    addRows(c.moves, 'Moved', 'move', (p) => h('span', { class: 'p', title: p }, W.get(p).from ? `${W.get(p).from}  →  ${p}` : p));
+    addRows(c.copies, 'Copy', 'copy', (p) => h('span', { class: 'p', title: p }, `${W.get(p).from}  →  ${p}`));
+    addRows(c.dels, 'Deleted', 'mod', (p) => h('span', { class: 'p del', title: p }, p));
+    const total = c.total;
+    const chips = [[c.adds.length, 'added', 'new'], [c.mods.length, 'edited', 'mod'], [c.moves.length, 'moved', 'move'], [c.copies.length, 'copied', 'copy'], [c.dels.length, 'deleted', 'mod']].filter((x) => x[0]).map(([n, l, cl]) => h('span', { class: `tag t-${cl}`, style: 'margin:0;height:20px;line-height:20px;font-size:12px' }, `${n} ${l}`));
+    const body = h('div', { class: 'sh-b' },
+      S.readOnly ? h('div', { class: 'note err' }, 'You don’t have write access to this repository, so GitHub will likely reject this commit.') : null,
+      h('div', { class: 'chips' }, chips),
+      h('div', { class: 'chg' }, rows, total > rows.length ? h('div', { class: 'cr muted' }, `…and ${total - rows.length} more`) : null),
+      h('div', { class: 'fld' }, h('div', { class: 'l' }, 'Commit message'), msgInp),
+      h('div', { style: 'display:flex;flex-direction:column;gap:8px' }, optD, optN));
+    const commitBtn = h('button', { class: 'xbtn pri', onClick: () => go() }, `Commit ${plural(total, 'change')}`);
+    const foot = h('div', { class: 'sh-f' },
+      h('button', { class: 'xbtn dng', onClick: async () => { const r = await dialog({ title: 'Discard all changes?', msg: 'Everything you moved, edited, added or deleted since the last reload will be lost.', buttons: [{ label: 'Cancel', value: null }, { label: 'Discard All', value: 'go', danger: true }] }); if (r.value) { closeSheet(); await loadTree(S.cwd); toast('Changes discarded.'); } } }, 'Discard All'),
+      h('div', { class: 'sum' }),
+      h('button', { class: 'xbtn', onClick: closeSheet }, 'Cancel'), commitBtn);
+    openSheet(h('div', { style: 'display:contents' }, h('div', { class: 'sh-h' }, h('div', { class: 'big' }, icon('upload', 20)), h('div', {}, h('div', { class: 'sh-t' }, 'Commit changes'), h('div', { class: 'sh-s' }, `${S.repo.full} · ${S.branch}`))), body, foot));
+    setTimeout(() => msgInp.focus(), 60);
+
+    async function go() {
+      const msg = msgInp.value.trim() || defaultMessage();
+      const nb = nbInp.value.trim();
+      if (mode === 'new' && (!/^\w[\w.\-/]*$/.test(nb) || /\.\.|\/\/|\/$|\.lock$/.test(nb))) { toast('Enter a valid name for the new branch.', { type: 'err' }); nbInp.focus(); return; }
+      const bar = h('i'); const pct = h('span', {}, '0%'); const note = h('span', {});
+      const stepEls = STEPS.map((l) => { const d = h('span', { class: 'd' }); const det = h('span', { class: 'det' }); return { el: h('div', { class: 'step' }, d, h('span', {}, l), det), d, det }; });
+      let cur = 0; let frac = 0;
+      const paint = (detail) => {
+        const p = Math.min(100, ((cur + frac) / STEPS.length) * 100);
+        bar.style.width = `${p}%`; pct.textContent = `${Math.round(p)}%`;
+        stepEls.forEach((s, k) => { s.el.className = `step ${k < cur ? 'done' : k === cur ? 'run' : ''}`; s.d.replaceChildren(k < cur ? icon('check', 11, 3) : k === cur ? h('span', { class: 'spin', style: 'width:10px;height:10px;border-width:1.5px' }) : ''); s.det.textContent = k === 1 && k === cur && detail ? detail : ''; });
+      };
+      const prog = { step: (i, f = 0, d = '') => { cur = i; frac = f; note.textContent = ''; paint(d); }, note: (t) => { note.textContent = t; } };
+      openSheet(h('div', { style: 'display:contents' }, h('div', { class: 'sh-h' }, h('div', { class: 'big' }, icon('upload', 20)), h('div', {}, h('div', { class: 'sh-t' }, 'Committing…'), h('div', { class: 'sh-s' }, 'Keep this tab open until it finishes.'))),
+        h('div', { class: 'sh-b' }, h('div', {}, h('div', { class: 'bar' }, bar), h('div', { style: 'display:flex;justify-content:space-between;margin-top:6px;font-size:12px;color:var(--fg2)' }, note, pct)), h('div', { class: 'steps' }, stepEls.map((s) => s.el)))), { lock: true });
+      paint();
+      try {
+        const res = await runCommit({ msg, mode, newBranch: nb }, prog);
+        if (res.cancelled) { showCommitSheet(); return; }
+        const url = `https://github.com/${S.repo.owner}/${S.repo.name}/commit/${res.sha}`;
+        const prUrl = `https://github.com/${S.repo.owner}/${S.repo.name}/pull/new/${encRef(res.branch)}`;
+        if (res.mode === 'new') { S.branch = res.branch; if (!S.branches.includes(res.branch)) S.branches.push(res.branch); }
+        openSheet(h('div', { style: 'display:contents' }, h('div', { class: 'sh-b', style: 'padding-top:18px' }, h('div', { class: 'center' }, h('div', { class: 'bigc' }, icon('check', 30, 2.6)), h('h3', {}, 'Committed'), h('p', {}, `${plural(res.count, 'change')} saved to `, h('b', {}, `${S.repo.full}`), ' on ', h('b', {}, res.branch), '.'),
+          h('div', { class: 'acts' }, h('a', { class: 'xbtn', href: url, target: '_blank', rel: 'noopener' }, `View commit ${res.sha.slice(0, 7)}`), res.mode === 'new' ? h('a', { class: 'xbtn pri', href: prUrl, target: '_blank', rel: 'noopener' }, 'Open pull request') : null))),
+          h('div', { class: 'sh-f' }, h('div', { class: 'sum' }), h('button', { class: 'xbtn', onClick: () => location.reload() }, 'Reload page'), h('button', { class: 'xbtn pri', onClick: closeSheet }, 'Done'))));
+        loadTree(S.cwd);
+      } catch (e) {
+        openSheet(h('div', { style: 'display:contents' }, h('div', { class: 'sh-h' }, h('div', { class: 'big', style: 'background:rgba(255,69,58,.15);color:var(--red)' }, icon('alert', 20)), h('div', {}, h('div', { class: 'sh-t' }, 'Commit failed'), h('div', { class: 'sh-s' }, 'Nothing changed on your branch. Your edits are still here.'))),
+          h('div', { class: 'sh-b' }, h('div', { class: 'note err' }, friendly(e))), h('div', { class: 'sh-f' }, h('div', { class: 'sum' }), e.status === 401 ? h('button', { class: 'xbtn', onClick: showTokenSheet }, 'Account & Token…') : null, h('button', { class: 'xbtn pri', onClick: showCommitSheet }, 'Back'))));
+      }
+    }
+  }
+
+  function movePicker(paths) {
+    paths = topLevel(paths);
+    if (!paths.length) return;
+    let target = null;
+    const list = h('div', { class: 'pk' });
+    const filter = h('input', { class: 'inp', placeholder: 'Filter folders', spellcheck: 'false', onInput: () => draw() });
+    const blocked = (d) => paths.some((p) => isDir(p) && (d === p || d.startsWith(`${p}/`)));
+    const stubNote = !B.complete ? h('div', { class: 'muted', style: 'font-size:12px' }, 'Large repository: only folders you have opened are listed.') : null;
+    function draw() {
+      const q = filter.value.trim().toLowerCase();
+      const dirs = ['', ...[...idx().keys()].filter(Boolean).sort((a, b) => collator.compare(a, b))].filter((d) => !q || d.toLowerCase().includes(q));
+      list.replaceChildren(...dirs.slice(0, 800).map((d) => {
+        const dis = blocked(d);
+        const depth = d ? d.split('/').length : 0;
+        const r = h('div', { class: `pkr${target === d ? ' on' : ''}${dis ? ' dis' : ''}`, style: `padding-left:${8 + (q ? 0 : depth * 16)}px`, onClick: () => { if (dis) return; target = d; draw(); }, onDblclick: () => { if (!dis) { target = d; go(false); } } });
+        const ic = h('span', { class: 'fico' }); ic.innerHTML = folderSvg(18);
+        r.append(ic, h('span', {}, q ? (d || S.repo.name) : (d ? basename(d) : S.repo.name)));
+        return r;
+      }));
+    }
+    const go = (copy) => { if (target == null) return toast('Choose a destination folder.'); closeSheet(); transfer(paths, target, copy); };
+    const label = paths.length === 1 ? `“${basename(paths[0])}”` : plural(paths.length, 'items');
+    draw();
+    openSheet(h('div', { style: 'display:contents' }, h('div', { class: 'sh-h' }, h('div', { class: 'big' }, icon('folderPlus', 20)), h('div', {}, h('div', { class: 'sh-t' }, `Move ${label} to…`), h('div', { class: 'sh-s' }, 'Pick a destination folder, or drag items onto a folder instead.'))),
+      h('div', { class: 'sh-b' }, filter, list, stubNote),
+      h('div', { class: 'sh-f' }, h('div', { class: 'sum' }), h('button', { class: 'xbtn', onClick: closeSheet }, 'Cancel'), h('button', { class: 'xbtn', onClick: () => go(true) }, 'Copy Here'), h('button', { class: 'xbtn pri', onClick: () => go(false) }, 'Move Here'))));
+    setTimeout(() => filter.focus(), 60);
+  }
+
+  async function openEditor(path, dir = S.cwd) {
+    const isNew = path == null;
+    let e = null; let original = '';
+    if (isNew) { try { await ensureShallow(dir); } catch (err) { return toast(friendly(err), { type: 'err' }); } }
+    else {
+      e = W.get(path);
+      if (!e || e.type === 'commit') return;
+      if (e.size > MAX_EDIT_BYTES) return toast(`“${basename(path)}” is too large to edit here (2 MB limit). Download it instead.`, { type: 'warn' });
+      toast('Opening…', { id: 'ed', ms: 800 });
+      let u8;
+      try { u8 = await getBytes(e); } catch (err) { return toast(friendly(err), { type: 'err' }); }
+      if (u8.subarray(0, 8000).includes(0)) return toast('This looks like a binary file, so it can’t be edited as text.', { type: 'warn' });
+      try { original = new TextDecoder('utf-8', { fatal: true }).decode(u8); } catch (_) { return toast('This file isn’t valid UTF-8 text, so it can’t be edited here.', { type: 'warn' }); }
+    }
+    const nameInp = isNew ? h('input', { class: 'inp', value: 'untitled.txt', spellcheck: 'false', style: 'max-width:300px' }) : null;
+    const ta = h('textarea', { class: 'ed-ta', spellcheck: 'false', value: original });
+    const gut = h('div', { class: 'ed-gut' });
+    const stat = h('span', { class: 'sum' });
+    const upd = () => {
+      const n = ta.value.split('\n').length;
+      if (gut.dataset.n !== String(n)) { gut.dataset.n = String(n); gut.textContent = Array.from({ length: n }, (_, i) => i + 1).join('\n'); }
+      gut.scrollTop = ta.scrollTop;
+      const before = ta.value.slice(0, ta.selectionStart).split('\n');
+      stat.textContent = `Ln ${before.length}, Col ${before[before.length - 1].length + 1}  ·  ${ta.value.length.toLocaleString()} characters  ·  UTF-8`;
+    };
+    ['input', 'keyup', 'click', 'scroll'].forEach((ev) => ta.addEventListener(ev, upd));
+    const close = async () => {
+      if (ta.value !== original && !(isNew && !ta.value)) { const r = await dialog({ title: 'Discard your changes?', msg: 'Your edits to this file haven’t been saved.', buttons: [{ label: 'Keep Editing', value: null }, { label: 'Discard', value: 'go', danger: true }] }); if (!r.value) return; }
+      closeSheet();
+    };
+    const save = async () => {
+      const text = ta.value;
+      if (isNew) {
+        const n = cleanPath(nameInp.value);
+        if (!n || !validPath(n)) return toast('Enter a valid file name.', { type: 'err' });
+        const full = join(dir, n);
+        let blocked = exists(full);
+        for (let d = dirname(full); d && !blocked; d = dirname(d)) if (W.has(d)) blocked = true;
+        if (blocked) return toast(`“${n}” already exists or clashes with a file.`, { type: 'err' });
+        closeSheet();
+        mutate(`New file “${basename(full)}”`, () => setW(full, newEntry(null, text)));
+        if (dir !== S.cwd) await navigate(dir);
+        const top = join(dir, n.split('/')[0]);
+        S.sel = new Set([top]); S.anchor = top; ui.all();
+        toast(`Added “${n}” to pending changes.`, { action: { label: 'Undo', fn: undo } });
+      } else {
+        if (text === original) return closeSheet();
+        closeSheet();
+        mutate(`Edit “${basename(path)}”`, () => setW(path, { ...W.get(path), text, file: null, dirty: true, size: new TextEncoder().encode(text).length }));
+        toast(`Saved “${basename(path)}” to pending changes.`, { action: { label: 'Undo', fn: undo } });
+      }
+    };
+    ta.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Tab') { ev.preventDefault(); const s = ta.selectionStart; ta.setRangeText('  ', s, ta.selectionEnd, 'end'); upd(); }
+      else if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === 's') { ev.preventDefault(); save(); }
+    });
+    const wrapBtn = h('button', { class: 'xbtn', onClick: () => { ta.classList.toggle('wrap'); wrapBtn.textContent = ta.classList.contains('wrap') ? 'Wrap: On' : 'Wrap: Off'; } }, 'Wrap: Off');
+    const head = h('div', { class: 'sh-h' }, isNew ? h('div', { class: 'big' }, icon('filePlus', 20)) : itemIcon({ name: basename(path), dir: false, e }, 32),
+      h('div', { style: 'flex:1;min-width:0' }, isNew ? h('div', { class: 'fld' }, h('div', { class: 'sh-s' }, `New file in ${dir ? `“${dir}”` : S.repo.name}`), nameInp) : h('div', {}, h('div', { class: 'sh-t' }, basename(path)), h('div', { class: 'sh-s' }, path))));
+    openSheet(h('div', { style: 'display:contents' }, head, h('div', { class: 'ed' }, gut, ta), h('div', { class: 'sh-f' }, stat, wrapBtn, h('button', { class: 'xbtn', onClick: close }, 'Cancel'), h('button', { class: 'xbtn pri', onClick: save }, isNew ? 'Add File' : 'Save'))), { wide: true, lock: true, onEsc: close });
+    upd();
+    setTimeout(() => (isNew ? nameInp : ta).focus(), 80);
+    if (isNew) setTimeout(() => { nameInp.select(); }, 90);
+  }
+
+  let qlPath = null;
+  async function openQuickLook(path) {
+    const e = W.get(path);
+    if (!e) return;
+    qlPath = path;
+    const body = h('div', { class: 'ql-b' }, h('div', { class: 'spin' }));
+    const canEdit = e.type !== 'commit' && !IMG_MIME[extOf(basename(path))] && !BIN_EXT.has(extOf(basename(path)));
+    qlLayer.replaceChildren(h('div', { class: 'ql' },
+      h('div', { class: 'ql-h' }, itemIcon({ name: basename(path), dir: false, e }, 20), h('div', { class: 't' }, basename(path), h('span', { class: 'muted', style: 'font-weight:400' }, `  ${kindOf(basename(path), false, e.type)} · ${fmt(e.size || 0)}`)),
+        canEdit ? h('button', { class: 'xbtn', onClick: () => { closeQuickLook(); openEditor(path); } }, icon('edit', 13), 'Edit') : null,
+        h('button', { class: 'xbtn', onClick: () => downloadItems([path]) }, icon('download', 13), 'Download'),
+        h('button', { class: 'xbtn', onClick: () => openOnGitHub(path) }, icon('ext', 13), 'GitHub'),
+        h('button', { class: 'tbtn', title: 'Close', onClick: closeQuickLook }, icon('x', 15))), body));
+    qlLayer.classList.add('show');
+    const r = await loadPreview(path, e);
+    if (qlPath !== path) return;
+    if (r.kind === 'image') body.replaceChildren(h('img', { src: r.url, alt: basename(path) }));
+    else if (r.kind === 'text') body.replaceChildren(h('pre', {}, r.text));
+    else body.replaceChildren(h('div', { class: 'empty' }, itemIcon({ name: basename(path), dir: false, e }, 96), h('h3', {}, basename(path)), h('p', {}, r.why || 'No preview available')));
+  }
+  function closeQuickLook() { qlPath = null; qlLayer.classList.remove('show'); qlLayer.replaceChildren(); ui.content.focus(); }
+  qlLayer.addEventListener('mousedown', (e) => { if (e.target === qlLayer) closeQuickLook(); });
+  function stepQuickLook(d) {
+    const files = vis.filter((x) => !x.dir);
+    const i = files.findIndex((x) => x.path === qlPath);
+    const n = files[clamp(i + d, 0, files.length - 1)];
+    if (n && n.path !== qlPath) { S.sel = new Set([n.path]); S.anchor = n.path; paintSel(); const el = ui.rowEls.get(n.path); if (el) el.scrollIntoView({ block: 'nearest' }); openQuickLook(n.path); }
+  }
+
+  function openItem(it) {
+    if (!it) return;
+    if (it.dir) { navigate(it.path); return; }
+    if (it.e && it.e.type === 'commit') return toast('Submodules can’t be opened here.');
+    const ext = extOf(it.name);
+    if (IMG_MIME[ext] || BIN_EXT.has(ext)) openQuickLook(it.path); else openEditor(it.path);
+  }
+
+  /* ───────────────────────── layout & window management ───────────────────────── */
+  ui.all = () => {
+    if (!ui.ready) return;
+    renderSide(); renderContent(); renderTools(); renderInsp(); renderPath(); updateFab(); applyLayout();
+  };
+  function applyLayout() {
+    win.classList.toggle('no-sb', !S.sidebar);
+    win.classList.toggle('no-insp', !S.inspector);
+    win.classList.toggle('max', S.max);
+  }
+  function applyWin() {
+    if (!S.win) {
+      const w = Math.min(1180, innerWidth - 40); const hh = Math.min(740, innerHeight - 40);
+      S.win = { x: Math.round((innerWidth - w) / 2), y: Math.round((innerHeight - hh) / 2), w, h: hh };
+    }
+    const st = win.style;
+    if (S.max) { st.left = '0'; st.top = '0'; st.width = '100vw'; st.height = '100vh'; }
+    else {
+      const W_ = clamp(S.win.w, 640, innerWidth); const H_ = clamp(S.win.h, 420, innerHeight);
+      S.win.x = clamp(S.win.x, 60 - W_, innerWidth - 60); S.win.y = clamp(S.win.y, 0, innerHeight - 40);
+      st.left = `${S.win.x}px`; st.top = `${S.win.y}px`; st.width = `${W_}px`; st.height = `${H_}px`;
+    }
+    applyLayout();
+  }
+  function showWin() { scrim.classList.add('show'); win.classList.remove('out'); win.classList.add('show'); applyWin(); applyTheme(); setTimeout(() => ui.content.focus(), 30); updateFab(); }
+  function hideWin() { scrim.classList.remove('show'); win.classList.add('out'); setTimeout(() => { if (!S.open || S.min) win.classList.remove('show', 'out'); }, 210); updateFab(); }
+  function closePanel() {
+    if (sheetOpen() && sheetCur && sheetCur.lock) { if (sheetCur.onEsc) { sheetCur.onEsc(); } else toast('Hang on, committing…'); return; }
+    closeMenu(); closeQuickLook(); S.open = false; hideWin();
+  }
+  function minimize() { closeMenu(); S.min = true; hideWin(); }
+  function toggleMax() { S.max = !S.max; applyWin(); }
+  function toggleSidebar() { S.sidebar = !S.sidebar; applyLayout(); renderTools(); }
+  function toggleInspector() { S.inspector = !S.inspector; GM_setValue('ghf_insp', S.inspector); applyLayout(); renderInsp(); renderTools(); }
+  function setView(v) {
+    S.view = v; GM_setValue('ghf_view', v); ui.seg.dataset.v = v;
+    ui.seg.querySelectorAll('button').forEach((b) => b.classList.toggle('on', b.dataset.v === v));
+    renderContent(); renderTools();
+  }
+  async function openPanel() {
+    if (!parsePage()) return;
+    S.open = true; S.min = false; showWin();
+    if (!token()) { showTokenSheet(); return; }
+    const page = parsePage();
+    const same = S.repo && S.repo.owner.toLowerCase() === page.owner.toLowerCase() && S.repo.name.toLowerCase() === page.name.toLowerCase();
+    if (!same || S.loadError) await loadLocation(); else ui.all();
+  }
+  function updateFab() {
+    const n = chg().total;
+    const show = !!parsePage() && (!S.open || S.min);
+    fab.classList.toggle('show', show);
+    if (fab._n !== n || !fab.firstChild) {
+      fab._n = n;
+      const ic = h('span', { class: 'fico' }); ic.innerHTML = folderSvg(22);
+      fab.replaceChildren(ic, 'Files', n ? h('span', { class: 'badge' }, n) : null);
+    }
+  }
+
+  const dragMove = (e, getStart, move) => {
+    e.preventDefault();
+    const sx = e.clientX; const sy = e.clientY; const st = getStart();
+    const mv = (ev) => move(st, ev.clientX - sx, ev.clientY - sy);
+    const up = () => { window.removeEventListener('mousemove', mv); };
+    window.addEventListener('mousemove', mv);
+    window.addEventListener('mouseup', up, { once: true });
+  };
+  const winDrag = (e) => {
+    if (e.button !== 0 || S.max || e.target.closest('button,input,a,.seg,.chip,.sbr,.sb-scroll,.sb-foot,.pill')) return;
+    dragMove(e, () => ({ x: S.win.x, y: S.win.y }), (st, dx, dy) => { S.win.x = st.x + dx; S.win.y = st.y + dy; applyWin(); });
+  };
+  ui.tb.addEventListener('mousedown', winDrag);
+  ui.sb.querySelector('.sb-top').addEventListener('mousedown', winDrag);
+  ui.tb.addEventListener('dblclick', (e) => { if (!e.target.closest('button,input,a,.seg,.chip,.pill,.search')) toggleMax(); });
+  resz.addEventListener('mousedown', (e) => { if (S.max) return; dragMove(e, () => ({ w: S.win.w, h: S.win.h }), (st, dx, dy) => { S.win.w = st.w + dx; S.win.h = st.h + dy; applyWin(); }); });
+  window.addEventListener('resize', () => { if (S.open) applyWin(); });
+  if (window.ResizeObserver) new ResizeObserver(() => win.classList.toggle('narrow', win.offsetWidth < 900)).observe(win);
+  scrim.addEventListener('mousedown', (e) => e.preventDefault());
+
+  /* view switch */
+  ui.seg.append(h('i', { class: 'thumb' }),
+    h('button', { 'data-v': 'icons', class: S.view === 'icons' ? 'on' : '', title: 'as Icons  ⌘1', onClick: () => setView('icons') }, icon('grid', 16)),
+    h('button', { 'data-v': 'list', class: S.view === 'list' ? 'on' : '', title: 'as List  ⌘2', onClick: () => setView('list') }, icon('list', 16)));
+
+  /* ───────────────────────── selection & content interactions ───────────────────────── */
+  let pendingCollapse = null;
+  const idxOfVis = (p) => vis.findIndex((x) => x.path === p);
+  function toggleExpand(p) {
+    if (S.exp.has(p)) { S.exp.delete(p); renderContent(); return; }
+    S.exp.add(p);
+    if (!isLoaded(p)) ensureShallow(p).then(() => ui.all()).catch((e) => { S.exp.delete(p); toast(friendly(e), { type: 'err' }); });
+    else renderContent();
+  }
+  function toggleSb(p) {
+    if (S.sbExp.has(p)) { S.sbExp.delete(p); renderSide(); return; }
+    S.sbExp.add(p);
+    if (!isLoaded(p)) ensureShallow(p).then(renderSide).catch((e) => toast(friendly(e), { type: 'err' }));
+    else renderSide();
+  }
+  const itemAt = (e) => { const el = e.target.closest && e.target.closest('[data-p]'); return el && ui.content.contains(el) ? el : null; };
+
+  function selectOnDown(e, el) {
+    const p = el.dataset.p; const mod = e.metaKey || e.ctrlKey;
+    pendingCollapse = null;
+    if (e.shiftKey && S.anchor && idxOfVis(S.anchor) >= 0) {
+      const a = idxOfVis(S.anchor); const b = idxOfVis(p);
+      const next = mod ? new Set(S.sel) : new Set();
+      for (let i = Math.min(a, b); i <= Math.max(a, b); i++) next.add(vis[i].path);
+      S.sel = next;
+    } else if (mod) { if (S.sel.has(p)) S.sel.delete(p); else S.sel.add(p); S.anchor = p; }
+    else if (!S.sel.has(p)) { S.sel = new Set([p]); S.anchor = p; }
+    else if (S.sel.size > 1) pendingCollapse = p;
+    S.cursor = p;
+    paintSel();
+  }
+  function startMarquee(e) {
+    const c = ui.content;
+    const r0 = c.getBoundingClientRect();
+    if (e.clientX > r0.left + c.clientWidth || e.clientY > r0.top + c.clientHeight) return;
+    const add = e.metaKey || e.ctrlKey || e.shiftKey;
+    const base = add ? new Set(S.sel) : new Set();
+    const sx = e.clientX - r0.left + c.scrollLeft; const sy = e.clientY - r0.top + c.scrollTop;
+    let box = null; let moved = false;
+    const mv = (ev) => {
+      const cx = ev.clientX - r0.left + c.scrollLeft; const cy = ev.clientY - r0.top + c.scrollTop;
+      if (!moved && Math.hypot(cx - sx, cy - sy) < 4) return;
+      if (!moved) { moved = true; box = h('div', { class: 'marq' }); c.append(box); }
+      const x = Math.min(sx, cx); const y = Math.min(sy, cy); const w = Math.abs(cx - sx); const hh = Math.abs(cy - sy);
+      Object.assign(box.style, { left: `${x}px`, top: `${y}px`, width: `${w}px`, height: `${hh}px` });
+      const sel = new Set(base);
+      for (const [p, el] of ui.rowEls) {
+        const rr = el.getBoundingClientRect();
+        const ex = rr.left - r0.left + c.scrollLeft; const ey = rr.top - r0.top + c.scrollTop;
+        if (ex < x + w && ex + rr.width > x && ey < y + hh && ey + rr.height > y) sel.add(p);
+      }
+      S.sel = sel;
+      for (const [p, el] of ui.rowEls) el.classList.toggle('sel', sel.has(p));
+    };
+    const up = () => { window.removeEventListener('mousemove', mv); if (box) box.remove(); if (!moved && !add) { S.sel = new Set(); S.anchor = null; } paintSel(); };
+    window.addEventListener('mousemove', mv);
+    window.addEventListener('mouseup', up, { once: true });
+  }
+
+  ui.content.addEventListener('mousedown', (e) => {
+    if (e.target.closest('.rn')) return;
+    closeMenu();
+    const el = itemAt(e);
+    if (e.button === 2) { if (el && !S.sel.has(el.dataset.p)) { S.sel = new Set([el.dataset.p]); S.anchor = el.dataset.p; paintSel(); } return; }
+    if (e.button !== 0) return;
+    if (el) { if (!e.target.closest('[data-tri]')) selectOnDown(e, el); return; }
+    if (!e.target.closest('.lh') && !e.target.closest('.empty')) startMarquee(e);
+  });
+  ui.content.addEventListener('click', (e) => {
+    const th = e.target.closest('[data-sort]');
+    if (th) { const k = th.dataset.sort; if (S.sort.key === k) S.sort.dir *= -1; else { S.sort.key = k; S.sort.dir = 1; } ui.all(); return; }
+    const tri = e.target.closest('[data-tri]');
+    if (tri) { toggleExpand(tri.closest('[data-p]').dataset.p); return; }
+    const el = itemAt(e);
+    if (el && pendingCollapse === el.dataset.p && !(e.metaKey || e.ctrlKey || e.shiftKey)) { S.sel = new Set([pendingCollapse]); S.anchor = pendingCollapse; paintSel(); }
+    pendingCollapse = null;
+  });
+  ui.content.addEventListener('dblclick', (e) => {
+    if (e.target.closest('.rn') || e.target.closest('[data-tri]')) return;
+    const el = itemAt(e);
+    if (el) openItem(itemMap.get(el.dataset.p));
+  });
+  ui.content.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    const el = itemAt(e);
+    if (el) showMenu(e.clientX, e.clientY, itemMenu(itemMap.get(el.dataset.p)));
+    else { if (S.sel.size) { S.sel = new Set(); paintSel(); } showMenu(e.clientX, e.clientY, bgMenu()); }
+  });
+
+  /* drag & drop (inside the window and from the desktop) */
+  const isFileDrag = (e) => e.dataTransfer && Array.from(e.dataTransfer.types || []).includes('Files');
+  let dropEl = null;
+  const clearDrop = () => { if (dropEl) { dropEl.classList.remove('dt', 'dt-bg'); dropEl = null; } };
+  const markDrop = (el) => { if (dropEl === el) return; clearDrop(); dropEl = el; el.classList.add(el === ui.content ? 'dt-bg' : 'dt'); };
+  function wireDrop(zone, resolve) {
+    zone.addEventListener('dragover', (e) => {
+      if (!S.drag && !isFileDrag(e)) return;
+      const t = resolve(e);
+      if (!t) { clearDrop(); return; }
+      e.preventDefault();
+      e.dataTransfer.dropEffect = S.drag ? (e.altKey ? 'copy' : 'move') : 'copy';
+      markDrop(t.el);
+    });
+    zone.addEventListener('dragleave', (e) => { if (!zone.contains(e.relatedTarget)) clearDrop(); });
+    zone.addEventListener('drop', (e) => {
+      const t = resolve(e); clearDrop();
+      if (!t) return;
+      e.preventDefault(); e.stopPropagation();
+      if (S.drag) { const paths = S.drag; S.drag = null; transfer(paths, t.dir, e.altKey); }
+      else if (isFileDrag(e)) externalDrop(e.dataTransfer, t.dir);
+    });
+  }
+  const dragSelf = (dir) => !!S.drag && S.drag.some((p) => dir === p || dir.startsWith(`${p}/`));
+  wireDrop(ui.content, (e) => {
+    const el = e.target.closest && e.target.closest('[data-p][data-d="1"]');
+    if (el && ui.content.contains(el)) { const d = el.dataset.p; return dragSelf(d) ? null : { dir: d, el }; }
+    if (S.q || !S.repo) return null;
+    return { dir: S.cwd, el: ui.content };
+  });
+  wireDrop(ui.sb, (e) => { const el = e.target.closest && e.target.closest('.sbr[data-sb]'); return el && !dragSelf(el.dataset.p) ? { dir: el.dataset.p, el } : null; });
+  wireDrop(ui.path, (e) => { const el = e.target.closest && e.target.closest('.crumb'); return el && !dragSelf(el.dataset.p) ? { dir: el.dataset.p, el } : null; });
+  ui.content.addEventListener('dragstart', (e) => {
+    const el = itemAt(e);
+    if (!el || e.target.closest('.rn')) { e.preventDefault(); return; }
+    const p = el.dataset.p;
+    if (!S.sel.has(p)) { S.sel = new Set([p]); S.anchor = p; paintSel(); }
+    pendingCollapse = null;
+    S.drag = topLevel([...S.sel]);
+    e.dataTransfer.effectAllowed = 'copyMove';
+    e.dataTransfer.setData('text/plain', S.drag.join('\n'));
+    try { const g = h('div', { class: 'dragimg' }, S.drag.length === 1 ? basename(S.drag[0]) : `${S.drag.length} items`); root.append(g); e.dataTransfer.setDragImage(g, 12, 12); setTimeout(() => g.remove(), 0); } catch (_) { /* optional */ }
+  });
+  ui.content.addEventListener('dragend', () => { S.drag = null; clearDrop(); });
+
+  /* sidebar, path bar, search, pickers */
+  const sbMenu = (p) => [
+    ...addMenu(p).slice(0, 6),
+    { sep: true },
+    p ? { label: 'Rename', act: async () => { await navigate(dirname(p)); beginRename(p); } } : null,
+    { label: 'Download as ZIP', act: () => downloadItems(p ? [p] : listDir('').map((x) => x.path)) },
+    { label: 'Copy Link', sub: linkMenu([p]) },
+    { label: 'Open on GitHub', act: () => openOnGitHub(p) },
+    p ? { sep: true } : null,
+    p ? { label: 'Delete', danger: true, act: () => deleteItems([p]) } : null,
+  ];
+  ui.sb.addEventListener('click', (e) => {
+    const add = e.target.closest('[data-add]');
+    if (add) { e.stopPropagation(); menuBelow(add, addMenu(add.dataset.add), false); return; }
+    const row = e.target.closest('[data-sb]');
+    if (row) { if (e.target.closest('[data-tri]')) toggleSb(row.dataset.p); else navigate(row.dataset.p); return; }
+    if (e.target.closest('[data-changes]')) { showCommitSheet(); return; }
+    const br = e.target.closest('[data-branch]'); if (br) { branchMenu(br); return; }
+    if (e.target.closest('[data-account]')) showTokenSheet();
+  });
+  ui.sb.addEventListener('contextmenu', (e) => { const row = e.target.closest('[data-sb]'); if (!row || !S.repo) return; e.preventDefault(); showMenu(e.clientX, e.clientY, sbMenu(row.dataset.p)); });
+  ui.path.addEventListener('click', (e) => { const c = e.target.closest('.crumb'); if (c) navigate(c.dataset.p); });
+  let searchT = null;
+  ui.search.addEventListener('input', () => { clearTimeout(searchT); searchT = setTimeout(() => { S.q = ui.search.value.trim(); S.sel = new Set(); renderContent(); renderPath(); }, 110); });
+  ui.fileInput.addEventListener('change', () => { const l = filesFromInput(ui.fileInput.files); if (l.length) addUploads(l, ui.pickDir); });
+  ui.dirInput.addEventListener('change', () => { const l = filesFromInput(ui.dirInput.files); if (l.length) addUploads(l, ui.pickDir); });
+
+  /* ───────────────────────── keyboard ───────────────────────── */
+  let typeBuf = ''; let typeT = null;
+  const iconCols = () => { const els = [...ui.rowEls.values()]; if (els.length < 2) return 1; const top = els[0].offsetTop; let n = 0; for (const el of els) { if (el.offsetTop === top) n++; else break; } return Math.max(1, n); };
+  function selectIndex(ni, shift) {
+    const it = vis[ni]; if (!it) return;
+    if (shift && S.anchor && idxOfVis(S.anchor) >= 0) { const a = idxOfVis(S.anchor); const next = new Set(); for (let i = Math.min(a, ni); i <= Math.max(a, ni); i++) next.add(vis[i].path); S.sel = next; }
+    else { S.sel = new Set([it.path]); S.anchor = it.path; }
+    S.cursor = it.path; paintSel();
+    const el = ui.rowEls.get(it.path); if (el) el.scrollIntoView({ block: 'nearest' });
+  }
+  function moveSel(key, shift) {
+    if (!vis.length) return;
+    const listMode = S.view === 'list' || S.q;
+    const cur = S.cursor && S.sel.has(S.cursor) ? idxOfVis(S.cursor) : S.sel.size ? idxOfVis([...S.sel].pop()) : -1;
+    let ni;
+    if (cur < 0) ni = key === 'ArrowUp' || key === 'ArrowLeft' ? vis.length - 1 : 0;
+    else if (listMode) {
+      const it = vis[cur];
+      if (key === 'ArrowDown') ni = cur + 1;
+      else if (key === 'ArrowUp') ni = cur - 1;
+      else if (key === 'ArrowRight') { if (it.dir && !S.q) { if (!S.exp.has(it.path)) { toggleExpand(it.path); return; } ni = cur + 1; } else return; }
+      else { if (it.dir && S.exp.has(it.path)) { toggleExpand(it.path); return; } const pi = idxOfVis(dirname(it.path)); if (pi < 0) return; ni = pi; }
+    } else ni = cur + (key === 'ArrowRight' ? 1 : key === 'ArrowLeft' ? -1 : key === 'ArrowDown' ? iconCols() : -iconCols());
+    selectIndex(clamp(ni, 0, vis.length - 1), shift);
+  }
+  function onKey(e) {
+    if (!S.open || S.min) return;
+    const t = e.composedPath()[0];
+    const typing = t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA');
+    const k = e.key; const mod = e.metaKey || e.ctrlKey;
+    if (dlgOpen()) return;
+    if (sheetOpen()) { if (k === 'Escape') { e.preventDefault(); if (sheetCur && sheetCur.onEsc) sheetCur.onEsc(); else if (!(sheetCur && sheetCur.lock)) closeSheet(); } return; }
+    if (menuEl) { if (k === 'Escape') { e.preventDefault(); closeMenu(); } return; }
+    if (qlPath) {
+      if (k === 'Escape' || k === ' ') { e.preventDefault(); closeQuickLook(); }
+      else if (k === 'ArrowRight' || k === 'ArrowDown') { e.preventDefault(); stepQuickLook(1); }
+      else if (k === 'ArrowLeft' || k === 'ArrowUp') { e.preventDefault(); stepQuickLook(-1); }
+      return;
+    }
+    if (typing) {
+      if (t === ui.search) {
+        if (k === 'Escape') { e.preventDefault(); ui.search.value = ''; S.q = ''; ui.search.blur(); ui.content.focus(); renderContent(); renderPath(); }
+        else if (k === 'ArrowDown') { e.preventDefault(); ui.content.focus(); if (vis[0]) selectIndex(0, false); }
+      }
+      return;
+    }
+    if (mod) {
+      const lk = k.toLowerCase();
+      if (lk === 'a') { e.preventDefault(); selectAll(); }
+      else if (lk === 'z') { e.preventDefault(); if (e.shiftKey) redo(); else undo(); }
+      else if (lk === 'c') { e.preventDefault(); copySel(false); }
+      else if (lk === 'x') { e.preventDefault(); copySel(true); }
+      else if (lk === 'v') { e.preventDefault(); paste(S.cwd); }
+      else if (lk === 'd') { e.preventDefault(); if (S.sel.size) transfer([...S.sel], dirname([...S.sel][0]), true); }
+      else if (lk === 'f') { e.preventDefault(); ui.search.focus(); ui.search.select(); }
+      else if (lk === 'n') { e.preventDefault(); if (e.shiftKey) newFolder(S.cwd); else newFile(S.cwd); }
+      else if (lk === 'i') { e.preventDefault(); toggleInspector(); }
+      else if (lk === 's' || k === 'Enter') { e.preventDefault(); showCommitSheet(); }
+      else if (k === '1') { e.preventDefault(); setView('icons'); }
+      else if (k === '2') { e.preventDefault(); setView('list'); }
+      else if (k === '[') { e.preventDefault(); goBack(); }
+      else if (k === ']') { e.preventDefault(); goFwd(); }
+      else if (k === '\\') { e.preventDefault(); toggleSidebar(); }
+      else if (k === 'ArrowUp') { e.preventDefault(); goUp(); }
+      else if (k === 'ArrowDown') { e.preventDefault(); const it = S.sel.size === 1 && (itemMap.get([...S.sel][0])); if (it) openItem(it); }
+      else if (k === 'Backspace' || k === 'Delete') { e.preventDefault(); deleteItems([...S.sel]); }
+      return;
+    }
+    if (k === 'ArrowUp' || k === 'ArrowDown' || k === 'ArrowLeft' || k === 'ArrowRight') { e.preventDefault(); moveSel(k, e.shiftKey); }
+    else if (k === ' ') { e.preventDefault(); if (S.sel.size === 1) { const p = [...S.sel][0]; if (W.has(p)) openQuickLook(p); } }
+    else if (k === 'Enter') { e.preventDefault(); if (S.sel.size === 1) beginRename([...S.sel][0]); }
+    else if (k === 'Delete' || k === 'Backspace') { e.preventDefault(); deleteItems([...S.sel]); }
+    else if (k === 'Escape') { e.preventDefault(); if (S.q) { ui.search.value = ''; S.q = ''; renderContent(); renderPath(); } else if (S.sel.size) { S.sel = new Set(); paintSel(); } else closePanel(); }
+    else if (k === 'Tab') { /* keep default focus movement */ }
+    else if (k.length === 1 && /\S/.test(k)) {
+      typeBuf += k.toLowerCase(); clearTimeout(typeT); typeT = setTimeout(() => { typeBuf = ''; }, 700);
+      const i = vis.findIndex((x) => x.name.toLowerCase().startsWith(typeBuf));
+      if (i >= 0) selectIndex(i, false);
+    }
+  }
+  root.addEventListener('keydown', (e) => { onKey(e); e.stopPropagation(); }); // stop GitHub's own hotkeys while the window has focus
+  ['keyup', 'keypress'].forEach((t) => root.addEventListener(t, (e) => e.stopPropagation()));
+
+  /* ───────────────────────── dragging files onto the GitHub page ───────────────────────── */
+  const hideVeil = () => veil.classList.remove('show');
+  window.addEventListener('dragenter', (e) => {
+    if ((S.open && !S.min) || !isFileDrag(e) || !parsePage()) return;
+    if (e.target && e.target.closest && e.target.closest('textarea, input, [contenteditable="true"], file-attachment')) return;
+    const p = parsePage();
+    veilText.textContent = `Drop to add to ${p.owner}/${p.name}`;
+    veil.classList.add('show');
+  });
+  veil.addEventListener('dragover', (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; });
+  veil.addEventListener('dragleave', (e) => { if (!e.relatedTarget) hideVeil(); });
+  veil.addEventListener('drop', (e) => { e.preventDefault(); hideVeil(); externalDrop(e.dataTransfer, null); });
+  window.addEventListener('dragend', hideVeil);
+  window.addEventListener('keydown', (e) => { if (e.key === 'Escape') hideVeil(); });
+  window.addEventListener('beforeunload', (e) => { if (chg().total) { e.preventDefault(); e.returnValue = ''; } });
+
+  /* ───────────────────────── boot ───────────────────────── */
+  setInterval(updateFab, 700);
+  ['turbo:load', 'turbo:render', 'pjax:end', 'popstate'].forEach((ev) => document.addEventListener(ev, updateFab));
+  if (typeof GM_registerMenuCommand === 'function') {
+    GM_registerMenuCommand('Open GitHub Finder', openPanel);
+    GM_registerMenuCommand('Set or change GitHub token', () => { if (!parsePage()) { alert('Open a repository page first.'); return; } S.open = true; S.min = false; showWin(); showTokenSheet(); });
+    GM_registerMenuCommand('Remove saved token', () => { GM_deleteValue(TOKEN_KEY); alert('Token removed.'); });
+  }
+  ui.ready = true;
+  ui.all();
+})();
